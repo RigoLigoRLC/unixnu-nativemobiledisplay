@@ -4,6 +4,7 @@
 // backend leaves stop; this class is not yet a published system display.
 #include "OriginalLegacyFramebufferABI.h"
 #include <IOKit/IOLib.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -32,13 +33,24 @@ extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32
 extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+extern "C" bool t733_display_bind_begin(void **previous, int *cpu);
+extern "C" void t733_display_bind_end(void *previous);
+extern "C" void t733_display_submission_observed(uint64_t start, uint64_t mapTicks,
+    uint64_t copyTicks, uint64_t totalTicks, uint64_t bytes,
+    bool reused, uint64_t hits, uint64_t mappings, bool paired,
+    uint64_t cpuStart, uint64_t cpuEnd, int boundCpu, uint64_t bindTicks);
+extern "C" void t733_display_mapping_observed(uint64_t scanout, uint64_t surface);
+#endif
 extern "C" void native_legacy_retirement_observed(IOService *);
-// GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
-// client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
+// The privileged GPU client accepts frames with sheng-fb-gpu=1 and owns their
+// memory during copying. sheng-early-retire controls whether acceptance retires
+// the swap immediately or native_legacy_gpu_complete retires it after copying.
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 extern "C" void native_legacy_gpu_fallback_observed(int status);
-// Swaps retired when the GPU client took the frame (before its copy finished), and copies that then failed after such a retirement.
-extern "C" {volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
+extern "C" {
+    volatile uint64_t native_legacy_early_retires, native_legacy_early_failures;
+}
 // Display refresh tick (boot-arg sheng-vsync=<Hz>, 0 or absent: off). The original family sends the compositor's vsync message (type 5)
 // through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
 // that subclass is not part of this port: without it the render server never saw a vsync. The GOP scanout has no vblank interrupt, so a
@@ -54,10 +66,213 @@ extern "C" uint64_t mach_continuous_time(void);
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
     return (format==0x42475241 && !planes) || (format==0x26424741 && planes<=1);
 }
+
+static uint64_t nativeLegacyCounter() {
+    uint64_t counter;
+    __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(counter) :: "memory");
+    return counter;
+}
+
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+// NativeLegacyCopyBinding keeps the current non-realtime thread on an online
+// T733 performance CPU while a frame is copied. The work-loop gate remains
+// held across the scheduling point, so another submission cannot enter.
+// Restoration occurs before completion and also on every early return.
+class NativeLegacyCopyBinding {
+    void *previous = nullptr;
+    bool active = false;
+
+public:
+    int cpu = -1;
+    uint64_t ticks = 0;
+
+    NativeLegacyCopyBinding() {
+        static int enabled = -1;
+        if (enabled < 0) {
+            unsigned argument = 0;
+            PE_parse_boot_argn("t733-display-bind-big", &argument, sizeof(argument));
+            enabled = argument == 1;
+        }
+        if (!enabled) {
+            return;
+        }
+
+        const uint64_t start = nativeLegacyCounter();
+        active = t733_display_bind_begin(&previous, &cpu);
+        ticks = nativeLegacyCounter() - start;
+    }
+
+    NativeLegacyCopyBinding(const NativeLegacyCopyBinding &) = delete;
+    NativeLegacyCopyBinding &operator=(const NativeLegacyCopyBinding &) = delete;
+
+    void restore() {
+        if (!active) {
+            return;
+        }
+
+        t733_display_bind_end(previous);
+        active = false;
+    }
+
+    ~NativeLegacyCopyBinding() {
+        restore();
+    }
+};
+
+// The caller validates both row ranges before copying. Each iteration transfers
+// 64 bytes with general registers; the caller drains stores before completion.
+static bool nativeLegacyCopyPairs(volatile void *destination, uint64_t destinationStride,
+    const void *source, uint64_t sourceStride, uint32_t width, uint32_t height) {
+    const uintptr_t destinationBase = reinterpret_cast<uintptr_t>(destination);
+    const uintptr_t sourceBase = reinterpret_cast<uintptr_t>(source);
+    if ((destinationBase | sourceBase | destinationStride | sourceStride) & 7) {
+        return false;
+    }
+
+    const uint64_t rowBytes = static_cast<uint64_t>(width) * 4;
+    const uint64_t pairedBytes = rowBytes & ~63ull;
+    for (uint32_t row = 0; row < height; ++row) {
+        uintptr_t output = destinationBase + row * destinationStride;
+        uintptr_t input = sourceBase + row * sourceStride;
+        uint64_t blocks = pairedBytes / 64;
+        if (blocks) {
+            __asm__ volatile(
+                "1:\n\t"
+                "ldp x8, x9, [%[input]]\n\t"
+                "ldp x10, x11, [%[input], #16]\n\t"
+                "ldp x12, x13, [%[input], #32]\n\t"
+                "ldp x14, x15, [%[input], #48]\n\t"
+                "stp x8, x9, [%[output]]\n\t"
+                "stp x10, x11, [%[output], #16]\n\t"
+                "stp x12, x13, [%[output], #32]\n\t"
+                "stp x14, x15, [%[output], #48]\n\t"
+                "add %[input], %[input], #64\n\t"
+                "add %[output], %[output], #64\n\t"
+                "subs %[blocks], %[blocks], #1\n\t"
+                "b.ne 1b\n\t"
+                : [input] "+&r"(input), [output] "+&r"(output), [blocks] "+&r"(blocks)
+                :
+                : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "cc", "memory");
+        }
+
+        for (uint64_t offset = pairedBytes; offset < rowBytes; offset += 4) {
+            *reinterpret_cast<volatile uint32_t *>(output) =
+                *reinterpret_cast<const uint32_t *>(input);
+            output += 4;
+            input += 4;
+        }
+    }
+    return true;
+}
+#endif
+
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+    // T733 records copy timings without two extra full-screen pixel scans.
+    uint32_t scanBudget=0;
+    bool pairedScanout = false;
+    // Each source mapping keeps its IOSurface owner and descriptor alive while
+    // subsequent swaps reuse the kernel page mappings. The family owns swaps.
+    struct SourceMapping {
+        OSObject *surface = nullptr;
+        IOMemoryDescriptor *memory = nullptr;
+        IOMemoryMap *mapping = nullptr;
+        uint64_t memoryLength = 0;
+    };
+    SourceMapping sourceMappings[4];
+    IOLock *sourceMappingLock = nullptr;
+    bool sourceMappingsEnabled = false;
+    unsigned nextSourceMapping = 0;
+    uint64_t sourceMappingHits = 0;
+    uint64_t sourceMappingCreates = 0;
+
+    static void releaseSourceMapping(SourceMapping &entry) {
+        OSSafeReleaseNULL(entry.mapping);
+        OSSafeReleaseNULL(entry.memory);
+        OSSafeReleaseNULL(entry.surface);
+        entry.memoryLength = 0;
+    }
+
+    void clearSourceMappings() {
+        if (!sourceMappingLock) {
+            return;
+        }
+
+        SourceMapping removed[4];
+        IOLockLock(sourceMappingLock);
+        sourceMappingsEnabled = false;
+        for (unsigned index = 0; index < 4; ++index) {
+            removed[index] = sourceMappings[index];
+            sourceMappings[index] = {};
+        }
+        nextSourceMapping = 0;
+        IOLockUnlock(sourceMappingLock);
+
+        for (auto &entry : removed) {
+            releaseSourceMapping(entry);
+        }
+    }
+
+    IOMemoryMap *mapSource(OSObject *surface, IOMemoryDescriptor *memory,
+        uint64_t allocation, bool &reused, uint64_t &hits, uint64_t &mappings) {
+        reused = false;
+        if (!sourceMappingLock) {
+            return nullptr;
+        }
+
+        IOLockLock(sourceMappingLock);
+        if (!sourceMappingsEnabled) {
+            IOLockUnlock(sourceMappingLock);
+            return nullptr;
+        }
+
+        const uint64_t memoryLength = memory->getLength();
+        for (auto &entry : sourceMappings) {
+            if (entry.memory == memory && entry.surface == surface &&
+                entry.memoryLength == memoryLength && entry.mapping &&
+                entry.mapping->getVirtualAddress() && entry.mapping->getLength() >= allocation) {
+                IOMemoryMap *mapping = entry.mapping;
+                mapping->retain();
+                reused = true;
+                hits = ++sourceMappingHits;
+                mappings = sourceMappingCreates;
+                IOLockUnlock(sourceMappingLock);
+                return mapping;
+            }
+        }
+
+        IOMemoryMap *mapping = memory->map(kIOMapAnywhere | kIOMapReadOnly);
+        SourceMapping removed;
+        if (mapping && mapping->getVirtualAddress() && mapping->getLength() >= allocation) {
+            ++sourceMappingCreates;
+            if (mapping->getLength() <= (64ull << 20)) {
+                unsigned slot = nextSourceMapping;
+                for (unsigned index = 0; index < 4; ++index) {
+                    if (!sourceMappings[index].mapping || sourceMappings[index].memory == memory) {
+                        slot = index;
+                        break;
+                    }
+                }
+                removed = sourceMappings[slot];
+                surface->retain();
+                memory->retain();
+                mapping->retain();
+                sourceMappings[slot] = {surface, memory, mapping, memoryLength};
+                nextSourceMapping = (slot + 1) % 4;
+            }
+        }
+        hits = sourceMappingHits;
+        mappings = sourceMappingCreates;
+        IOLockUnlock(sourceMappingLock);
+
+        releaseSourceMapping(removed);
+        return mapping;
+    }
+#else
     uint32_t scanBudget=32;
+#endif
     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
     bool primary=false;
     bool logicalPM=false;
@@ -80,8 +295,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
     uint64_t gpuLength=0;
     bool gpuBypass=false;
-    // The swap of the frame the GPU client is copying already retired (boot-arg sheng-early-retire, default 1).
-    bool gpuRetired=false;
+    // The accepted GPU frame has already completed the family's swap request.
+    bool gpuRetired = false;
     // The refresh tick runs on the family's work loop, the loop of the command gate that registers and removes the vsync clients, so the
     // client queue at +5592 never changes while the sender walks it.
     IOTimerEventSource *vsyncTimer=nullptr;
@@ -141,12 +356,36 @@ public:
         };
         if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
     }
-    void free() override {stopVsync();if(logicalPM){PMstop();logicalPM=false;}primary=false;OSSafeReleaseNULL(bootMapping);IOMobileFramebufferLegacy::free();}
+    void free() override {
+        stopVsync();
+        if (logicalPM) {
+            PMstop();
+            logicalPM = false;
+        }
+        primary = false;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        clearSourceMappings();
+        if (sourceMappingLock) {
+            IOLockFree(sourceMappingLock);
+            sourceMappingLock = nullptr;
+        }
+#endif
+        OSSafeReleaseNULL(bootMapping);
+        IOMobileFramebufferLegacy::free();
+    }
     void stop(IOService *provider) override {
         stopVsync();
-        transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
+        transferred = false;
+        for (auto &entry : validated) {
+            entry = nullptr;
+        }
+        gpuRequest = nullptr;
+        gpuRetired = false;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        clearSourceMappings();
+#endif
     }
     // The panel is already lit by the firmware's GOP framebuffer, which is the one thing the original code's power-state word (display+5840,
     // the "powered" half of the state pair next to +5836) is meant to say; the platform subclass that normally writes it is not part of this
@@ -163,6 +402,17 @@ public:
         startVsync();return true;
     }
     bool startDisplay(IOService *provider) {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (!sourceMappingLock) {
+            sourceMappingLock = IOLockAlloc();
+        }
+        if (!sourceMappingLock) {
+            return false;
+        }
+        IOLockLock(sourceMappingLock);
+        sourceMappingsEnabled = true;
+        IOLockUnlock(sourceMappingLock);
+#endif
         if(!IOMobileFramebufferLegacy::start(provider))return false;
         if(primary && bootMapping)announcePoweredByFirmware();
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-pm",&enabled,sizeof(enabled));
@@ -207,17 +457,20 @@ public:
     // The render server paces its display timer by the minimum refresh interval in IOMFBDisplayRefresh (int-209: no vsync client ever
     // registered, frames came every 16.7 ms), and the generic slot 301 fixes it at 1/60 s. With sheng-vsync=<Hz> it reports the panel's
     // own rate instead; the maximum interval and the step keep the original values. Words in 32.32 seconds, then their mach times.
-    // The original maximum interval is 1/24 s (int-240), which offers the render server a 24 to sheng-vsync Hz range. The panel has no
-    // variable refresh, so sheng-vsync-fixed=1 reports the maximum interval equal to the minimum: one fixed rate.
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
         if(hz<=60 || hz>240)return true;
-        unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
+        unsigned locked = 0;
+        PE_parse_boot_argn("sheng-vsync-fixed", &locked, sizeof(locked));
         const uint64_t interval=(1ull<<32)/hz;
         uint64_t machTime=0;nanoseconds_to_absolutetime(interval*1000000000ull>>32,&machTime);
         words[0]=interval;words[1]=machTime;
-        if(fixed || locked==1){words[2]=interval;words[3]=machTime;}
+        // A fixed-rate panel reports the same minimum and maximum interval.
+        if (fixed || locked == 1) {
+            words[2] = interval;
+            words[3] = machTime;
+        }
         native_legacy_vsync_observed(5,hz);
         return true;
     }
@@ -226,6 +479,20 @@ public:
     // previous frame until the user touched it again). A retirement inside a kick only asks the running kick to loop.
     bool kicking=false,rekick=false;
     void kickSwapQueue() override {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        IOWorkLoop *loop = getWorkLoop();
+        if (!loop) {
+            return;
+        }
+        loop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+            static_cast<NativeLegacyDisplay *>(owner)->kickSwapQueueGated();
+            return kIOReturnSuccess;
+        }, this);
+#else
+        kickSwapQueueGated();
+#endif
+    }
+    void kickSwapQueueGated() {
         armVsync();
         if(kicking){rekick=true;return;}
         kicking=true;
@@ -297,18 +564,32 @@ public:
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
-            shadowValid=false;gpuRequest=request;gpuLength=length;transferred=true;
-            // The compositor renders the next frame only after this swap retires, so retiring at the end of the copy serialized render and
-            // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
-            // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
-            // the copy because transferred stays set until finishGpuSwap.
-            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof(early));
-            if(early==1 && retireSwap(request,true)) {
-                gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
+            shadowValid = false;
+            gpuRequest = request;
+            gpuLength = length;
+            transferred = true;
+
+            // The GPU presenter retains the source memory while the compositor
+            // renders its next frame. transferred blocks its next submission
+            // until finishGpuSwap reports completion of this copy.
+            unsigned early = 1;
+            PE_parse_boot_argn("sheng-early-retire", &early, sizeof(early));
+            if (early == 1 && retireSwap(request, true)) {
+                gpuRetired = true;
+                native_legacy_early_retires = native_legacy_early_retires + 1;
             }
             return;
         }
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        const uint64_t submissionStart = nativeLegacyCounter();
+        bool sourceReused = false;
+        uint64_t sourceHits = 0, sourceCreates = 0;
+        IOMemoryMap *source = mapSource(surface, memory, allocation,
+            sourceReused, sourceHits, sourceCreates);
+        const uint64_t mappingEnd = nativeLegacyCounter();
+#else
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly);
+#endif
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
@@ -330,7 +611,15 @@ public:
         if(!native_legacy_prepare_scanout()) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
-        uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        NativeLegacyCopyBinding copyBinding;
+#endif
+        const uint64_t copyStart = nativeLegacyCounter();
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        uint64_t copyCpuStart;
+        __asm__ volatile("mrs %0, mpidr_el1" : "=r"(copyCpuStart));
+        bool pairedCopy = false;
+#endif
         uint64_t stored=UINT64_MAX;
         {
             // Store only what changed since the previous frame (the scanout memory is slow device memory).
@@ -349,7 +638,17 @@ public:
         }
         if(stored==UINT64_MAX) {
             shadowValid=false;
-            if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+            bool copied = false;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+            if (pairedScanout) {
+                copied = nativeLegacyCopyPairs(
+                    reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                    video.v_rowBytes, reinterpret_cast<const void *>(source->getVirtualAddress()),
+                    sourceStride, width, height);
+                pairedCopy = copied;
+            }
+#endif
+            if(!copied && !native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
                 source->getLength(),sourceStride,width,height)) {
                 OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
@@ -357,8 +656,27 @@ public:
             stored=length;
         }
         __asm__ volatile("dsb sy" ::: "memory");
-        {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
-        OSSafeReleaseNULL(source);transferred=true;
+        const uint64_t copyEnd = nativeLegacyCounter();
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        uint64_t copyCpuEnd;
+        __asm__ volatile("mrs %0, mpidr_el1" : "=r"(copyCpuEnd));
+        copyBinding.restore();
+        t733_display_mapping_observed(bootMapping->getVirtualAddress(),
+            source->getVirtualAddress());
+#endif
+        OSSafeReleaseNULL(source);
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        // The total includes source acquisition, layout handling, copying and
+        // releasing the call's mapping reference; cached mappings remain live.
+        // The original display family retires the request below this report.
+        t733_display_submission_observed(submissionStart, mappingEnd-submissionStart,
+            copyEnd-copyStart, nativeLegacyCounter()-submissionStart, stored,
+            sourceReused, sourceHits, sourceCreates, pairedCopy, copyCpuStart, copyCpuEnd,
+            copyBinding.cpu, copyBinding.ticks);
+#else
+        native_legacy_copy_timing_observed(copyEnd-copyStart,stored);
+#endif
+        transferred=true;
         native_legacy_transfer_observed(kIOReturnSuccess,request,length);
         finishTransfer(request);
     }
@@ -367,13 +685,20 @@ public:
         const OriginalLegacySwapRequest *request=gpuRequest;
         if(!request)return;
         gpuRequest=nullptr;
-        if(gpuRetired) {
-            // The swap retired when the client took it; its copy ending only releases the next frame. A failed copy loses this frame
-            // (the next one takes the CPU copy).
-            gpuRetired=false;
-            if(status==0)native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
-            else {native_legacy_early_failures=native_legacy_early_failures+1;native_legacy_gpu_fallback_observed(status);gpuBypass=true;}
-            transferred=false;kickSwapQueue();return;
+        if (gpuRetired) {
+            // Retirement released the family's request. A failed GPU copy
+            // drops this frame and sends the next queued frame through CPU copy.
+            gpuRetired = false;
+            if (status == 0) {
+                native_legacy_transfer_observed(kIOReturnSuccess, request, gpuLength);
+            } else {
+                native_legacy_early_failures = native_legacy_early_failures + 1;
+                native_legacy_gpu_fallback_observed(status);
+                gpuBypass = true;
+            }
+            transferred = false;
+            kickSwapQueue();
+            return;
         }
         if(status==0) {
             native_legacy_transfer_observed(kIOReturnSuccess,request,gpuLength);
@@ -382,26 +707,32 @@ public:
         native_legacy_gpu_fallback_observed(status);
         transferred=false;gpuBypass=true;kickSwapQueue();
     }
-    // Hands the pending head to the unchanged family's completion. Leaves transferred alone: the callers decide when the next frame may go.
-    bool retireSwap(const OriginalLegacySwapRequest *request,bool force) {
+    // The family completes the pending request and releases its references.
+    // Callers retain transferred until their CPU or GPU copy has finished.
+    bool retireSwap(const OriginalLegacySwapRequest *request, bool force) {
         unsigned retire=0,cpuPresent=0;
         PE_parse_boot_argn("offline-legacy-retire",&retire,sizeof(retire));
         PE_parse_boot_argn("offline-legacy-cpu-present",&cpuPresent,sizeof(cpuPresent));
-        if(!(retire==1 || cpuPresent==1 || force))return false;
-        if(!activateOnlyPendingSwap(request))return false;
+        if (!(retire == 1 || cpuPresent == 1 || force)) {
+            return false;
+        }
+        if (!activateOnlyPendingSwap(request)) {
+            return false;
+        }
+
         removeValidated(request);
         IOMobileFramebufferLegacy::completeCurrentSwap();
         native_legacy_retirement_observed(this);
         return true;
     }
-    // Separately gated retirement after a real scanout store, shared by copied and blank frames.
-    void finishTransfer(const OriginalLegacySwapRequest *request,bool force=false) {
-        // Only after the real copy and store barrier: select the actual pending head and let the unchanged family release it and wake
-        // waiters. This reports memory scanout completion, not a panel vblank or hardware fence.
-        if(!retireSwap(request,force))return;
-        // The unchanged family has retired this generation and released its current reference. Permit the next independently validated
-        // single pending frame. Keep the latch set while completion can reenter this method, and whenever retirement remains disabled.
-        transferred=false;
+    // CPU and blank-frame callers complete their stores before retiring the
+    // request. transferred remains set while family completion can reenter.
+    void finishTransfer(const OriginalLegacySwapRequest *request, bool force = false) {
+        if (!retireSwap(request, force)) {
+            return;
+        }
+
+        transferred = false;
         kickSwapQueue();
     }
     IOReturn collectCompletionReports(uint32_t,void *,uint32_t *count,uint32_t) override {
@@ -411,6 +742,26 @@ public:
         return kIOReturnUnsupported;
     }
     bool validateSwap(const OriginalLegacySwapRequest *request) override {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        IOWorkLoop *loop = getWorkLoop();
+        if (!loop) {
+            return false;
+        }
+        struct Validation {
+            const OriginalLegacySwapRequest *request;
+            bool accepted;
+        } validation = {request, false};
+        loop->runAction([](OSObject *owner, void *argument, void *, void *, void *) -> IOReturn {
+            Validation *validation = static_cast<Validation *>(argument);
+            validation->accepted = static_cast<NativeLegacyDisplay *>(owner)->validateSwapGated(validation->request);
+            return kIOReturnSuccess;
+        }, this, &validation);
+        return validation.accepted;
+#else
+        return validateSwapGated(request);
+#endif
+    }
+    bool validateSwapGated(const OriginalLegacySwapRequest *request) {
         // Qualified original request fields are packed; use memcpy for each
         // access. Accept only one full-frame, untransformed, nonplanar BGRA
         // surface with real original backing memory. No generic capability
@@ -495,7 +846,17 @@ public:
            !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
            video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
            video.v_rowBytes>UINT64_MAX/video.v_height)return false;
-        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+        IOOptionBits cacheMode = kIOMapInhibitCache;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        unsigned writeCombine = 0;
+        PE_parse_boot_argn("t733-fb-writecombine", &writeCombine, sizeof(writeCombine));
+        if (writeCombine == 1) {
+            // The console maps this reserved DRAM with the same Normal
+            // Non-Cacheable attribute before either display mapping is used.
+            cacheMode = kIOMapWriteCombineCache;
+        }
+#endif
+        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,cacheMode);
         if(!mapping)return false;
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
@@ -504,7 +865,15 @@ public:
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
             valid=width==video.v_width && height==video.v_height;
             if(valid) {
-                OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
+                OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+                // T733 has one firmware scanout. v_display selects graphics or
+                // verbose text at boot; both modes use this same primary panel.
+                primary = true;
+                pairedScanout = (bootMapping->getMapOptions() & kIOMapCacheMask) == kIOMapWriteCombineCache;
+#else
+                primary = video.v_display == 1;
+#endif
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
             }
         }

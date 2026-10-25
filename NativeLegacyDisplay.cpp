@@ -3,6 +3,9 @@
 // Reuse the unchanged original generic framebuffer implementation. Unknown
 // backend leaves stop; this class is not yet a published system display.
 #include "OriginalLegacyFramebufferABI.h"
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+#include "OriginalAppleARMBacklightABI.h"
+#endif
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -12,6 +15,8 @@
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSDictionary.h>
 #include <pexpert/pexpert.h>
 extern "C" __attribute__((noreturn)) void native_legacy_backend_guard(unsigned,void *,void *);
 extern "C" IOService *native_legacy_display_allocate(void);
@@ -34,6 +39,10 @@ extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+extern "C" bool t733_display_power_start(void);
+extern "C" IOReturn t733_display_set_power(bool);
+extern "C" IOReturn t733_display_set_brightness(uint32_t, uint32_t);
+extern "C" IOReturn t733_display_set_millinits(uint32_t, uint32_t *);
 extern "C" bool t733_display_bind_begin(void **previous, int *cpu);
 extern "C" void t733_display_bind_end(void *previous);
 extern "C" void t733_display_submission_observed(uint64_t start, uint64_t mapTicks,
@@ -74,6 +83,208 @@ static uint64_t nativeLegacyCounter() {
 }
 
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+    static bool nativePublishBrightness(IOService *display, uint32_t level, uint32_t milliNits) {
+        OSDictionary *parameters = OSDictionary::withCapacity(2);
+        OSDictionary *brightness = OSDictionary::withCapacity(3);
+        OSDictionary *nits = OSDictionary::withCapacity(3);
+        auto number = [](OSDictionary *dictionary, const char *name, uint32_t value) -> bool {
+            OSNumber *object = OSNumber::withNumber(value, 32);
+            bool result = dictionary && object && dictionary->setObject(name, object);
+            OSSafeReleaseNULL(object);
+            return result;
+        };
+        bool result = parameters && brightness && nits &&
+            number(brightness, "min", 0) && number(brightness, "max", 255) &&
+            number(brightness, "value", level) &&
+            number(nits, "min", 4000) && number(nits, "max", 500000) &&
+            number(nits, "value", milliNits) &&
+            parameters->setObject("brightness", brightness) &&
+            parameters->setObject("BrightnessMilliNits", nits) &&
+            display->setProperty("IODisplayParameters", parameters);
+        OSSafeReleaseNULL(nits);
+        OSSafeReleaseNULL(brightness);
+        OSSafeReleaseNULL(parameters);
+        return result;
+    }
+
+static bool nativePublishBacklightCalibration(IOService *display) {
+    OSDictionary *calibration = OSDictionary::withCapacity(9);
+    if (!calibration) {
+        return false;
+    }
+
+    // CoreBrightness dereferences every calibration number. Current fields
+    // retain zero defaults; this service controls the panel through nits.
+    const struct {
+        const char *name;
+        uint32_t fixed;
+    } entries[] = {
+        {"current-for-max-backlight", 0},
+        {"current-for-mid-backlight", 0},
+        {"hardware-max-current-limit", 0},
+        {"lMinProduct", 4U << 16},
+        {"lMidProduct", 190U << 16},
+        {"lMaxProduct", 500U << 16},
+        {"lMinPanel", 4U << 16},
+        {"lMidPanel", 190U << 16},
+        {"lMaxPanel", 500U << 16}
+    };
+    bool result = true;
+    for (const auto &entry : entries) {
+        OSNumber *number = OSNumber::withNumber(entry.fixed, 32);
+        if (!number || !calibration->setObject(entry.name, number)) {
+            result = false;
+        }
+        OSSafeReleaseNULL(number);
+        if (!result) {
+            break;
+        }
+    }
+
+    if (result) {
+        result = display->setProperty("backlight-calibration-parameters", calibration);
+    }
+    calibration->release();
+
+    return result;
+}
+
+// NativeT733Backlight is the T733 panel's brightness service and inherits the
+// existing AppleARMPlatform AppleARMBacklight metaclass. CoreBrightness matches
+// backlight-control and requires that base class before creating its display
+// module, even when QuartzCore provides brightness transactions.
+// The primary NativeLegacyDisplay owns the service. Its parameter dictionary
+// supplies the panel range, and brightness-nits requests reach DisplayPower's
+// serialized DSI, boost and touch operations.
+// BrightnessControl delivers those requests while preparing each frame. The
+// inherited framebuffer swap method retains the compositor's frame metadata.
+class NativeT733Backlight : public AppleARMBacklight {
+    OSDeclareDefaultStructors(NativeT733Backlight)
+    IOLock *brightnessLock = nullptr;
+
+public:
+    bool init(OSDictionary *properties = nullptr) override {
+        return IOService::init(properties);
+    }
+
+    bool start(IOService *provider) override {
+        if (!IOService::start(provider)) {
+            return false;
+        }
+
+        brightnessLock = IOLockAlloc();
+        // CoreBrightness reads equally spaced slider samples as signed 16.16
+        // nits and requires this table for new-backlight-architecture displays.
+        const int32_t marketingNits[] = {4 << 16, 190 << 16, 500 << 16};
+        OSData *marketingTable = OSData::withBytes(marketingNits, sizeof(marketingNits));
+        const bool ready = brightnessLock && marketingTable &&
+            nativePublishBrightness(this, 125, 190000) &&
+            nativePublishBacklightCalibration(this) &&
+            setProperty("backlight-control", true) &&
+            setProperty("backlight-marketing-table", marketingTable) &&
+            setProperty("new-backlight-architecture", true);
+        OSSafeReleaseNULL(marketingTable);
+
+        if (!ready) {
+            IOService::stop(provider);
+            return false;
+        }
+
+        setName("T733PanelBacklight");
+        return true;
+    }
+
+    IOReturn setProperties(OSObject *properties) override {
+        OSDictionary *dictionary = OSDynamicCast(OSDictionary, properties);
+        if (!dictionary) {
+            return kIOReturnBadArgument;
+        }
+
+        OSObject *object = dictionary->getObject("brightness-nits");
+        const bool usesNits = object != nullptr;
+        if (!object) {
+            object = dictionary->getObject("brightness");
+        }
+        if (!object) {
+            return IOService::setProperties(properties);
+        }
+        OSNumber *number = OSDynamicCast(OSNumber, object);
+        if (!number) {
+            return kIOReturnBadArgument;
+        }
+
+        uint32_t level = 0;
+        uint32_t milliNits = 0;
+        if (usesNits) {
+            const int32_t fixed = static_cast<int32_t>(number->unsigned32BitValue());
+            milliNits = fixed > 0 ?
+                static_cast<uint32_t>((static_cast<uint64_t>(fixed) * 1000 + 32768) >> 16) : 0;
+            if (milliNits > 500000) {
+                milliNits = 500000;
+            }
+        } else {
+            level = number->unsigned32BitValue();
+            if (level > 255) {
+                return kIOReturnBadArgument;
+            }
+
+            if (level > 125) {
+                milliNits = 190000 + (level - 125) * 310000 / 130;
+            } else if (level > 2) {
+                milliNits = 4000 + (level - 2) * 186000 / 123;
+            } else if (level) {
+                milliNits = 4000;
+            }
+        }
+
+        IOLockLock(brightnessLock);
+        IOReturn result = usesNits ? t733_display_set_millinits(milliNits, &level) :
+            t733_display_set_brightness(level, 255);
+        if (result == kIOReturnSuccess && !nativePublishBrightness(this, level, milliNits)) {
+            result = kIOReturnNoMemory;
+        }
+        IOLockUnlock(brightnessLock);
+
+        return result;
+    }
+
+    void free() override {
+        if (brightnessLock) {
+            IOLockFree(brightnessLock);
+            brightnessLock = nullptr;
+        }
+        IOService::free();
+    }
+
+    IOWorkLoop *getWorkLoop() const override {
+        return IOService::getWorkLoop();
+    }
+
+    IOReturn configureReport(IOReportChannelList *channels, IOReportConfigureAction action,
+        void *result, void *destination) override {
+        return IOService::configureReport(channels, action, result, destination);
+    }
+
+    IOReturn updateReport(IOReportChannelList *channels, IOReportUpdateAction action,
+        void *result, void *destination) override {
+        return IOService::updateReport(channels, action, result, destination);
+    }
+
+    IOReturn callPlatformFunction(const OSSymbol *name, bool wait,
+        void *param1, void *param2, void *param3, void *param4) override {
+        return IOService::callPlatformFunction(name, wait, param1, param2, param3, param4);
+    }
+
+    IOReturn message(UInt32 type, IOService *provider, void *argument) override {
+        return IOService::message(type, provider, argument);
+    }
+
+    IOReturn setPowerState(unsigned long ordinal, IOService *device) override {
+        return IOService::setPowerState(ordinal, device);
+    }
+};
+OSDefineMetaClassAndStructors(NativeT733Backlight, AppleARMBacklight)
+
 // NativeLegacyCopyBinding keeps the current non-realtime thread on an online
 // T733 performance CPU while a frame is copied. The work-loop gate remains
 // held across the scheduling point, so another submission cannot enter.
@@ -170,6 +381,44 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+    NativeT733Backlight *backlight = nullptr;
+
+    bool startBacklight() {
+        if (backlight || !primary) {
+            return true;
+        }
+
+        NativeT733Backlight *service = new NativeT733Backlight;
+        if (!service || !service->init()) {
+            OSSafeReleaseNULL(service);
+            return false;
+        }
+
+        if (!service->attach(this)) {
+            service->release();
+            return false;
+        }
+        if (!service->start(this)) {
+            service->detach(this);
+            service->release();
+            return false;
+        }
+
+        backlight = service;
+        backlight->registerService();
+        IOLog("T733 display: NativeT733Backlight service ready base=AppleARMBacklight parameters=1 backlight=1 calibration-nits=6 marketing-table=3 new-architecture=1\n");
+        return true;
+    }
+
+    void stopBacklight() {
+        if (!backlight) {
+            return;
+        }
+
+        backlight->terminate(kIOServiceRequired | kIOServiceSynchronous);
+        OSSafeReleaseNULL(backlight);
+    }
+
     // T733 records copy timings without two extra full-screen pixel scans.
     uint32_t scanBudget=0;
     bool pairedScanout = false;
@@ -347,6 +596,12 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
 public:
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+    IOReturn applyDisplayState() override {
+        IOReturn result = t733_display_set_power(requestedAndPowered());
+        return result == kIOReturnNotReady ? kIOReturnSuccess : result;
+    }
+#endif
     // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
     void gpuComplete(int status) {
         struct Args {NativeLegacyDisplay *display;int status;} args={this,status};
@@ -364,6 +619,7 @@ public:
         }
         primary = false;
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        stopBacklight();
         clearSourceMappings();
         if (sourceMappingLock) {
             IOLockFree(sourceMappingLock);
@@ -375,6 +631,9 @@ public:
     }
     void stop(IOService *provider) override {
         stopVsync();
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        stopBacklight();
+#endif
         transferred = false;
         for (auto &entry : validated) {
             entry = nullptr;
@@ -398,6 +657,9 @@ public:
         setter(this,&request,false);
     }
     bool start(IOService *provider) override {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        t733_display_power_start();
+#endif
         if(!startDisplay(provider))return false;
         startVsync();return true;
     }
@@ -421,9 +683,8 @@ public:
         if(enabled!=1 || phase!=4 || !provider || !bootMapping || !primary) {
             native_legacy_pm_observed(1,kIOReturnNotReady,0);IOMobileFramebufferLegacy::stop(provider);return false;
         }
-        // Actual IOKit PM lifecycle for logical scanout scheduling only. GOP
-        // provides no panel power switch: neither state advertises physical
-        // power output, power control or a hardware power transition.
+        // The framebuffer PM state controls the panel and touch coordinator.
+        // The firmware video engine continues reading the retained framebuffer.
         static IOPMPowerState states[2]={};
         states[0].version=states[1].version=1;
         states[1].capabilityFlags=kIOPMDeviceUsable;
@@ -438,6 +699,13 @@ public:
     IOReturn setPowerState(unsigned long ordinal,IOService *device) override {
         if(!logicalPM)return IOMobileFramebufferLegacy::setPowerState(ordinal,device);
         if(ordinal>1 || !bootMapping){native_legacy_pm_observed(3,kIOReturnUnsupported,ordinal);return kIOReturnUnsupported;}
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        IOReturn power = t733_display_set_power(ordinal != 0 && requestedAndPowered());
+        if (power != kIOReturnSuccess && power != kIOReturnNotReady) {
+            native_legacy_pm_observed(3, power, ordinal);
+            return power;
+        }
+#endif
         native_legacy_pm_observed(3,kIOReturnSuccess,ordinal);
         IOReturn status=IOMobileFramebufferLegacy::setPowerState(ordinal,device);
         native_legacy_pm_observed(4,status,ordinal);return status;
@@ -445,6 +713,11 @@ public:
     // The explicit offline system-client experiment publishes only the real
     // GOP mode. Unknown backend calls retain their stop-with-caller guards.
     void registerService(IOOptionBits options=0) override {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (!startBacklight()) {
+            IOLog("T733 display: NativeT733Backlight service could not start\n");
+        }
+#endif
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
         // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own

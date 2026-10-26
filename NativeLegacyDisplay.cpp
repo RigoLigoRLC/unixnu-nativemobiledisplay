@@ -5,6 +5,7 @@
 #include "OriginalLegacyFramebufferABI.h"
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
 #include "OriginalAppleARMBacklightABI.h"
+#include "NativeDpuSurface.h"
 #endif
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
@@ -50,6 +51,11 @@ extern "C" void t733_display_submission_observed(uint64_t start, uint64_t mapTic
     bool reused, uint64_t hits, uint64_t mappings, bool paired,
     uint64_t cpuStart, uint64_t cpuEnd, int boundCpu, uint64_t bindTicks);
 extern "C" void t733_display_mapping_observed(uint64_t scanout, uint64_t surface);
+extern "C" IOReturn native_adreno_capture_surface_producer(uint32_t *capturedFence)
+    __attribute__((weak_import));
+extern "C" IOReturn native_adreno_poll_surface_producer(uint32_t capturedFence)
+    __attribute__((weak_import));
+extern "C" IOReturn native_legacy_surface_fence_complete(OSObject *fence, IOReturn status);
 #endif
 extern "C" void native_legacy_retirement_observed(IOService *);
 // The privileged GPU client accepts frames with sheng-fb-gpu=1 and owns their
@@ -64,7 +70,7 @@ extern "C" {
 // through native_legacy_vsync_notify, the unchanged original sender, but only a platform subclass calls it from the panel's vblank and
 // that subclass is not part of this port: without it the render server never saw a vsync. The GOP scanout has no vblank interrupt, so a
 // work-loop timer stands in for it while at least one client has vsync notifications enabled. Events: 0 armed, 1 sent, 2 idle (no client),
-// 3 late (deadline passed, cadence restarted), 4 started, 5 refresh properties reported at that rate.
+// 3 late (missed intervals skipped), 4 started, 5 refresh properties reported at that rate.
 extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);
 // The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
 extern "C" bool native_legacy_set_refresh_properties(void *display);
@@ -542,6 +548,407 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         validated[0]=request;
     }
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+    IOReturn surfaceProducerError = kIOReturnSuccess;
+    bool dpuFallback = false;
+    bool dpuBlocked = false;
+    bool displayStopping = false;
+    IOTimerEventSource *surfaceTimer = nullptr;
+    IOWorkLoop *producerLoop = nullptr;
+    IOTimerEventSource *producerTimer = nullptr;
+    IOLock *producerLock = nullptr;
+    bool surfaceTimerAdded = false;
+    bool producerTimerAdded = false;
+
+    // The producer work loop owns capture and cache acquisition. The display
+    // gate owns producerRequest and consumes the result under producerLock.
+    // A generation change discards an in-flight result after request cancel.
+    uint64_t producerGeneration = 0;
+    uint64_t producerDeadline = 0;
+    uint64_t producerBegan = 0;
+    uint32_t producerFence = 0;
+    IOReturn producerResult = kIOReturnNotReady;
+    bool producerPending = false;
+    bool producerCaptured = false;
+    bool producerDone = false;
+    const OriginalLegacySwapRequest *producerRequest = nullptr;
+
+    enum DpuCompletion {
+        NoDpuCompletion,
+        SurfaceCompletion,
+        BlankCompletion,
+        FallbackCompletion,
+        DroppedCompletion
+    };
+    DpuCompletion dpuCompletion = NoDpuCompletion;
+    const OriginalLegacySwapRequest *dpuRequest = nullptr;
+    bool dpuRestoring = false;
+    uint64_t dpuLength = 0;
+    IOReturn dpuResult = kIOReturnSuccess;
+
+    static OSObject *requestObject(const OriginalLegacySwapRequest *request) {
+        return reinterpret_cast<OSObject *>(const_cast<OriginalLegacySwapRequest *>(request));
+    }
+
+    void armSurfaceTimer(unsigned milliseconds = 1) {
+        if (surfaceTimer && !displayStopping) {
+            surfaceTimer->setTimeoutMS(milliseconds);
+        }
+    }
+
+    void clearProducerRequest() {
+        if (producerLock) {
+            IOLockLock(producerLock);
+            ++producerGeneration;
+            producerPending = false;
+            producerDone = false;
+            producerCaptured = false;
+            IOLockUnlock(producerLock);
+        }
+
+        const OriginalLegacySwapRequest *request = producerRequest;
+        producerRequest = nullptr;
+        if (request) {
+            requestObject(request)->release();
+        }
+    }
+
+    static void producerFired(OSObject *owner, IOTimerEventSource *) {
+        static_cast<NativeLegacyDisplay *>(owner)->pollProducer();
+    }
+
+    void pollProducer() {
+        IOLockLock(producerLock);
+        const uint64_t generation = producerGeneration;
+        const bool pending = producerPending;
+        bool captured = producerCaptured;
+        uint32_t fence = producerFence;
+        const uint64_t deadline = producerDeadline;
+        IOLockUnlock(producerLock);
+        if (!pending) {
+            return;
+        }
+
+        IOReturn result = kIOReturnSuccess;
+        if (!!native_adreno_capture_surface_producer != !!native_adreno_poll_surface_producer) {
+            result = kIOReturnUnsupported;
+        } else if (!captured) {
+            result = native_adreno_capture_surface_producer ?
+                native_adreno_capture_surface_producer(&fence) : kIOReturnSuccess;
+            captured = result == kIOReturnSuccess;
+        }
+        if (captured && result == kIOReturnSuccess && native_adreno_poll_surface_producer) {
+            result = native_adreno_poll_surface_producer(fence);
+        }
+        const bool expired = mach_absolute_time() >= deadline;
+
+        IOLockLock(producerLock);
+        const bool current = producerPending && generation == producerGeneration;
+        if (current) {
+            producerCaptured = captured;
+            producerFence = fence;
+            if (expired || (result != kIOReturnTimeout && result != kIOReturnNotReady)) {
+                producerResult = expired && (result == kIOReturnTimeout || result == kIOReturnNotReady) ?
+                    kIOReturnTimeout : result;
+                producerDone = true;
+                producerPending = false;
+            }
+        }
+        IOLockUnlock(producerLock);
+
+        if (current && !expired && (result == kIOReturnTimeout || result == kIOReturnNotReady)) {
+            producerTimer->setTimeoutMS(1);
+        }
+    }
+
+    IOReturn waitSurfaceProducer(const OriginalLegacySwapRequest *request, uint32_t *fence) {
+        if (!producerLock || !producerTimer || displayStopping) {
+            return kIOReturnNotResponding;
+        }
+        if (producerRequest != request) {
+            clearProducerRequest();
+            requestObject(request)->retain();
+            producerRequest = request;
+
+            IOLockLock(producerLock);
+            uint64_t timeout = 0;
+            nanoseconds_to_absolutetime(5000000000ull, &timeout);
+            producerBegan = mach_absolute_time();
+            producerDeadline = producerBegan + timeout;
+            producerFence = 0;
+            producerResult = kIOReturnNotReady;
+            producerPending = true;
+            IOLockUnlock(producerLock);
+            producerTimer->setTimeoutMS(1);
+        }
+
+        IOLockLock(producerLock);
+        const bool done = producerDone;
+        const IOReturn result = producerResult;
+        *fence = producerFence;
+        IOLockUnlock(producerLock);
+        if (!done) {
+            armSurfaceTimer();
+            return kIOReturnNotReady;
+        }
+        if (result != kIOReturnSuccess) {
+            if (result != surfaceProducerError) {
+                IOLog("T733 display: producer status=%x fence=%u request=%p\n",
+                    result, *fence, request);
+                surfaceProducerError = result;
+            }
+            return result;
+        }
+
+        surfaceProducerError = kIOReturnSuccess;
+        return kIOReturnSuccess;
+    }
+
+    void failUnscannedRequest(const OriginalLegacySwapRequest *request, IOReturn status) {
+        OSObject *fence = layerZeroFence(request);
+        if (fence) {
+            const IOReturn completed = native_legacy_surface_fence_complete(fence, status);
+            if (completed != kIOReturnSuccess) {
+                IOLog("T733 display: failed read-fence completion status=%x request=%p\n",
+                    completed, request);
+                return;
+            }
+            transferLayerZeroFence(request);
+            fence->release();
+        }
+        native_legacy_transfer_observed(status, request, 0);
+        transferred = true;
+        finishTransfer(request, true);
+    }
+
+    void holdDpuRequest(const OriginalLegacySwapRequest *request, DpuCompletion completion,
+        uint64_t length) {
+        requestObject(request)->retain();
+        dpuRequest = request;
+        dpuCompletion = completion;
+        dpuLength = length;
+        dpuResult = kIOReturnSuccess;
+        transferred = true;
+    }
+
+    void completeDpuRequest(bool blocked = false) {
+        const OriginalLegacySwapRequest *request = dpuRequest;
+        const DpuCompletion completion = dpuCompletion;
+        const uint64_t length = dpuLength;
+        const IOReturn result = dpuResult;
+        dpuRequest = nullptr;
+        dpuCompletion = NoDpuCompletion;
+        dpuRestoring = false;
+        dpuBlocked = blocked;
+
+        const bool queued = request && pendingSwapRequest() == request && isValidated(request);
+        if (queued && completion != FallbackCompletion) {
+            native_legacy_transfer_observed(result, request,
+                completion == DroppedCompletion ? 0 : length);
+            retireSwap(request, true);
+        } else if (request && !queued) {
+            removeValidated(request);
+        }
+        transferred = false;
+        if (request) {
+            requestObject(request)->release();
+        }
+        if (completion == FallbackCompletion || completion == DroppedCompletion) {
+            gpuBypass = true;
+        }
+        kickSwapQueueGated();
+    }
+
+    bool beginDpuRestore(bool disableContext) {
+        const IOReturn result = t733_dpu_surface_begin_restore(disableContext);
+        if (result != kIOReturnSuccess) {
+            IOLog("T733 DPU surface: restore submit failed status=%x\n", result);
+            dpuResult = result;
+            dpuCompletion = DroppedCompletion;
+            completeDpuRequest(true);
+            return false;
+        }
+
+        dpuRestoring = true;
+        armSurfaceTimer();
+        return true;
+    }
+
+    static void surfaceFired(OSObject *owner, IOTimerEventSource *) {
+        static_cast<NativeLegacyDisplay *>(owner)->surfaceTick();
+    }
+
+    void surfaceTick() {
+        if (displayStopping || dpuBlocked) {
+            return;
+        }
+        if (dpuCompletion != NoDpuCompletion) {
+            const IOReturn result = t733_dpu_surface_poll();
+            if (result == kIOReturnNotReady) {
+                armSurfaceTimer();
+                return;
+            }
+            if (result != kIOReturnSuccess) {
+                IOLog("T733 DPU surface: asynchronous completion status=%x restore=%u\n",
+                    result, dpuRestoring);
+                if (dpuRestoring) {
+                    dpuResult = result;
+                    dpuCompletion = DroppedCompletion;
+                    completeDpuRequest(true);
+                    return;
+                }
+
+                dpuFallback = true;
+                dpuCompletion = DroppedCompletion;
+                dpuResult = result;
+                beginDpuRestore(true);
+                return;
+            }
+
+            completeDpuRequest();
+            return;
+        }
+
+        if (producerRequest) {
+            if (pendingSwapRequest() != producerRequest || !isValidated(producerRequest)) {
+                removeValidated(producerRequest);
+                clearProducerRequest();
+            }
+            kickSwapQueueGated();
+        }
+    }
+
+    bool startSurfaceEvents() {
+        IOWorkLoop *loop = getWorkLoop();
+        if (!loop) {
+            return false;
+        }
+        producerLock = IOLockAlloc();
+        producerLoop = IOWorkLoop::workLoop();
+        surfaceTimer = IOTimerEventSource::timerEventSource(this, &NativeLegacyDisplay::surfaceFired);
+        // Producer cache acquisition runs on producerLoop's thread. Default
+        // timer actions share XNU's serial kernel-high thread-call group with
+        // the display's frame and vsync timers.
+        producerTimer = IOTimerEventSource::timerEventSource(
+            kIOTimerEventSourceOptionsPriorityWorkLoop, this, &NativeLegacyDisplay::producerFired);
+        if (!producerLock || !producerLoop || !surfaceTimer || !producerTimer) {
+            return false;
+        }
+        if (loop->addEventSource(surfaceTimer) != kIOReturnSuccess) {
+            return false;
+        }
+        surfaceTimerAdded = true;
+        if (producerLoop->addEventSource(producerTimer) != kIOReturnSuccess) {
+            return false;
+        }
+        producerTimerAdded = true;
+
+        displayStopping = false;
+        return true;
+    }
+
+    void stopDpuSurface() {
+        IOWorkLoop *loop = getWorkLoop();
+        const bool alreadyGated = loop && loop->inGate();
+        if (!producerLock && !surfaceTimer && !producerTimer && !producerLoop) {
+            return;
+        }
+
+        auto begin = [](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+            NativeLegacyDisplay *display = static_cast<NativeLegacyDisplay *>(owner);
+            display->displayStopping = true;
+            display->transferred = true;
+            if (display->surfaceTimer) {
+                display->surfaceTimer->disable();
+                display->surfaceTimer->cancelTimeout();
+            }
+            display->clearProducerRequest();
+            return t733_dpu_surface_begin_restore(true);
+        };
+        IOReturn result = loop ? loop->runAction(begin, this) : begin(this, nullptr, nullptr, nullptr, nullptr);
+
+        // Removal waits for the producer callback to leave its work loop. That
+        // callback never enters the display gate and holds no result lock here.
+        if (producerTimer) {
+            if (producerLoop && producerTimerAdded) {
+                producerLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+                    NativeLegacyDisplay *display = static_cast<NativeLegacyDisplay *>(owner);
+                    display->producerTimer->disable();
+                    display->producerTimer->cancelTimeout();
+                    return kIOReturnSuccess;
+                }, this);
+            } else {
+                producerTimer->disable();
+                producerTimer->cancelTimeout();
+            }
+            if (producerTimerAdded) {
+                producerLoop->removeEventSource(producerTimer);
+                producerTimerAdded = false;
+            }
+        }
+        if (surfaceTimerAdded && loop) {
+            loop->removeEventSource(surfaceTimer);
+            surfaceTimerAdded = false;
+        }
+        OSSafeReleaseNULL(producerTimer);
+        OSSafeReleaseNULL(producerLoop);
+        OSSafeReleaseNULL(surfaceTimer);
+
+        auto poll = [](OSObject *, void *, void *, void *, void *) -> IOReturn {
+            return t733_dpu_surface_poll();
+        };
+        while (result == kIOReturnSuccess || result == kIOReturnNotReady) {
+            result = loop ? loop->runAction(poll, this) : poll(this, nullptr, nullptr, nullptr, nullptr);
+            if (result != kIOReturnNotReady || alreadyGated) {
+                break;
+            }
+            IOSleep(1);
+        }
+        if (result != kIOReturnSuccess) {
+            IOLog("T733 DPU surface: stop restore failed status=%x; scanout resources retained\n", result);
+        }
+        if (dpuRequest) {
+            requestObject(dpuRequest)->release();
+            dpuRequest = nullptr;
+        }
+        dpuCompletion = NoDpuCompletion;
+        dpuRestoring = false;
+        dpuBlocked = result != kIOReturnSuccess;
+        transferred = false;
+        if (producerLock) {
+            IOLockFree(producerLock);
+            producerLock = nullptr;
+        }
+    }
+
+    bool presentDpuSurface(const OriginalLegacySwapRequest *request, OSObject *surface,
+        IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height,
+        uint32_t producerFence) {
+        if (dpuBlocked) {
+            return true;
+        }
+        if (dpuFallback || !t733_dpu_surface_enabled()) {
+            return false;
+        }
+
+        holdDpuRequest(request, SurfaceCompletion, stride * height);
+        IOReturn result = t733_dpu_surface_begin(surface, memory, stride, width, height,
+            layerZeroFence(request), producerFence, mach_absolute_time() - producerBegan);
+        if (result == kIOReturnSuccess) {
+            transferLayerZeroFence(request);
+            clearProducerRequest();
+            armSurfaceTimer();
+            return true;
+        }
+
+        IOLog("T733 DPU surface: present failed status=%x fence=%u request=%p\n",
+            result, producerFence, request);
+        dpuFallback = true;
+        dpuCompletion = FallbackCompletion;
+        beginDpuRestore(true);
+        return true;
+    }
+#endif
     uint64_t gpuLength=0;
     bool gpuBypass=false;
     // The accepted GPU frame has already completed the family's swap request.
@@ -552,6 +959,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t vsyncInterval=0,vsyncNext=0;
     unsigned vsyncHz=0;
     bool vsyncArmed=false;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+    uint32_t vsyncFrame = 0;
+    bool vsyncFrameKnown = false;
+#endif
     bool vsyncWanted() const {
         const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
     }
@@ -568,10 +979,42 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!vsyncTimer)return;
         if(!vsyncWanted()){native_legacy_vsync_observed(2,vsyncHz);return;}
         const uint64_t now=mach_absolute_time();
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        uint32_t frame = 0;
+        const IOReturn timing = requestedAndPowered() ?
+            t733_dpu_surface_frame(&frame) : kIOReturnOffline;
+        if (timing == kIOReturnSuccess) {
+            const bool advanced = vsyncFrameKnown && frame != vsyncFrame;
+            vsyncFrame = frame;
+            vsyncFrameKnown = true;
+            if (advanced) {
+                native_legacy_vsync_notify(this, now, mach_continuous_time(), vsyncInterval);
+                native_legacy_vsync_observed(1, vsyncHz);
+            }
+            uint64_t poll = 0;
+            nanoseconds_to_absolutetime(1000000, &poll);
+            const uint64_t delay = advanced && vsyncInterval > 2 * poll ?
+                vsyncInterval - 2 * poll : poll;
+            vsyncNext = now + delay;
+            vsyncArmed = true;
+            vsyncTimer->wakeAtTime(vsyncNext);
+            return;
+        }
+        vsyncFrameKnown = false;
+        if (timing == kIOReturnOffline) {
+            vsyncNext = now + vsyncInterval;
+            vsyncArmed = true;
+            vsyncTimer->wakeAtTime(vsyncNext);
+            return;
+        }
+#endif
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
         native_legacy_vsync_observed(1,vsyncHz);
         vsyncNext+=vsyncInterval;
-        if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
+        if (vsyncNext <= now) {
+            vsyncNext += ((now - vsyncNext) / vsyncInterval + 1) * vsyncInterval;
+            native_legacy_vsync_observed(3, vsyncHz);
+        }
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
     }
     void startVsync() {
@@ -591,8 +1034,18 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     }
     void stopVsync() {
         if(!vsyncTimer)return;
-        vsyncTimer->cancelTimeout();
-        if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(vsyncTimer);
+        auto disable = [](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+            NativeLegacyDisplay *display = static_cast<NativeLegacyDisplay *>(owner);
+            display->vsyncTimer->disable();
+            display->vsyncTimer->cancelTimeout();
+            return kIOReturnSuccess;
+        };
+        if (IOWorkLoop *loop = getWorkLoop()) {
+            loop->runAction(disable, this);
+            loop->removeEventSource(vsyncTimer);
+        } else {
+            disable(this, nullptr, nullptr, nullptr, nullptr);
+        }
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
 public:
@@ -613,6 +1066,9 @@ public:
     }
     void free() override {
         stopVsync();
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        stopDpuSurface();
+#endif
         if (logicalPM) {
             PMstop();
             logicalPM = false;
@@ -632,6 +1088,7 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        stopDpuSurface();
         stopBacklight();
 #endif
         transferred = false;
@@ -661,6 +1118,12 @@ public:
         t733_display_power_start();
 #endif
         if(!startDisplay(provider))return false;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (primary && bootMapping && !startSurfaceEvents()) {
+            stop(provider);
+            return false;
+        }
+#endif
         startVsync();return true;
     }
     bool startDisplay(IOService *provider) {
@@ -720,27 +1183,42 @@ public:
 #endif
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
-        // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own
-        // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more.
+        // The platform publishes the selected panel interval before a client
+        // can inspect IOMFBDisplayRefresh.
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-        if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
+        if (primary && hz && hz <= 240) {
+            native_legacy_set_refresh_properties(this);
+        }
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
-    // The render server paces its display timer by the minimum refresh interval in IOMFBDisplayRefresh (int-209: no vsync client ever
-    // registered, frames came every 16.7 ms), and the generic slot 301 fixes it at 1/60 s. With sheng-vsync=<Hz> it reports the panel's
-    // own rate instead; the maximum interval and the step keep the original values. Words in 32.32 seconds, then their mach times.
+    bool isTimingEnabled() override {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        return t733_dpu_surface_timing_enabled();
+#else
+        return primary && bootMapping;
+#endif
+    }
+    // IOMFBDisplayRefresh contains the selected interval in 32.32 seconds and
+    // mach ticks. T733's 60 Hz video panel reports equal minimum and maximum
+    // intervals; other modes use the original range unless fixed is requested.
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-        if(hz<=60 || hz>240)return true;
+        if (!hz || hz > 240) {
+            return true;
+        }
         unsigned locked = 0;
         PE_parse_boot_argn("sheng-vsync-fixed", &locked, sizeof(locked));
         const uint64_t interval=(1ull<<32)/hz;
         uint64_t machTime=0;nanoseconds_to_absolutetime(interval*1000000000ull>>32,&machTime);
         words[0]=interval;words[1]=machTime;
         // A fixed-rate panel reports the same minimum and maximum interval.
-        if (fixed || locked == 1) {
+        bool fixedPanel = fixed || locked == 1;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        fixedPanel = fixedPanel || hz == 60;
+#endif
+        if (fixedPanel) {
             words[2] = interval;
             words[3] = machTime;
         }
@@ -777,17 +1255,25 @@ public:
         kicking=false;
     }
     void kickOnce() {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (displayStopping) {
+            return;
+        }
+        if (dpuBlocked) {
+            const OriginalLegacySwapRequest *request = pendingSwapRequest();
+            if (request && isValidated(request)) {
+                failUnscannedRequest(request, kIOReturnNotResponding);
+            }
+            return;
+        }
+#endif
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-transfer",&enabled,sizeof(enabled));
         if(enabled!=1 || transferred || !logicalPM || !bootMapping || !primary)return;
         const OriginalLegacySwapRequest *request=pendingSwapRequest();
         if(!request || !isValidated(request))return;
-        // This bounded first-frame transfer preserves the original queue's
-        // resource ownership. Separately gated retirement follows the copy;
-        // neither path signals a hardware fence, announces a vblank or
-        // claims general producer synchronization.
-        // The owned GPU instrument completes its work before submission.
-        // The separate original software-renderer experiment uses completed
-        // synchronous CPU surfaces, with no GPU or display fence fabricated.
+        // The family owns this pending request until presentation completes.
+        // DPU submission transfers its active surface read fence before the
+        // display gate opens; producer acquisition finishes on another loop.
         OSObject *surface=nullptr;
         memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+2624,sizeof(surface));
         if(!surface) {
@@ -806,6 +1292,14 @@ public:
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
             __asm__ volatile("dsb sy" ::: "memory");
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+            if (t733_dpu_surface_active()) {
+                shadowValid = false;
+                holdDpuRequest(request, BlankCompletion, blankLength);
+                beginDpuRestore(false);
+                return;
+            }
+#endif
             shadowValid=false;
             transferred=true;
             native_legacy_frame_observed(1,0,0,0,0,0);
@@ -829,11 +1323,30 @@ public:
            !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (!layerZeroFenceActive(request)) {
+            return;
+        }
+        uint32_t producerFence = 0;
+        const IOReturn producerStatus = waitSurfaceProducer(request, &producerFence);
+        if (producerStatus == kIOReturnNotReady) {
+            return;
+        }
+        if (producerStatus != kIOReturnSuccess) {
+            failUnscannedRequest(request, producerStatus);
+            return;
+        }
+#endif
         // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display; the GPU path needs that as much
         // as the CPU copy (int-093: accepted swaps were GPU-copied under a page that kept drawing).
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (presentDpuSurface(request, surface, memory, sourceStride, width, height, producerFence)) {
+            return;
+        }
+#endif
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
@@ -994,6 +1507,11 @@ public:
         }
 
         removeValidated(request);
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (producerRequest == request) {
+            clearProducerRequest();
+        }
+#endif
         IOMobileFramebufferLegacy::completeCurrentSwap();
         native_legacy_retirement_observed(this);
         return true;
@@ -1159,7 +1677,6 @@ public:
     LEAF(306)
     LEAF(307)
     LEAF(338)
-    LEAF(345)
 #undef LEAF
 };
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)

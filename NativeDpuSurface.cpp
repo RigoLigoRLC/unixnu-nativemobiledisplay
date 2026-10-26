@@ -25,7 +25,7 @@ constexpr uint64_t PageBytes = 4096;
 constexpr uint64_t SectionBytes = 0x200000;
 constexpr uint32_t SurfaceIova = 0x40000000;
 constexpr uint32_t SurfaceBytes = 0x02000000;
-constexpr unsigned SurfaceCount = 4;
+constexpr unsigned SurfaceCount = 2;
 constexpr unsigned SurfaceTablePages = SurfaceBytes / SectionBytes;
 constexpr uint64_t PhysicalLimit = UINT64_C(1) << 36;
 constexpr uint32_t MdpPhysical = 0x0ae00000;
@@ -48,16 +48,13 @@ constexpr uint32_t TranslationControl2 = 0x00038011;
 constexpr unsigned FlipMilliseconds = 80;
 enum : unsigned { NoOperation, SurfaceOperation, FirmwareOperation };
 
-// NativeDpuSurfaceBuffer retains an IOSurface, its prepared descriptor and its
-// page-table entries while that surface occupies one cached scanout IOVA.
-// The active read fence or use count covers only its current presentation;
-// replacement ends that read while the mapping remains available for reuse.
+// NativeDpuSurfaceBuffer owns the IOSurface and its wired descriptor for one
+// scanout IOVA independently of the display family's completed swap request.
 struct NativeDpuSurfaceBuffer {
     OSObject *surface = nullptr;
     OSObject *fence = nullptr; // An active read fence holds queued writers until this surface is replaced.
     IOMemoryDescriptor *memory = nullptr;
     uint64_t bytes = 0;
-    uint64_t lastUsed = 0;
     uint32_t stride = 0;
     bool prepared = false;
     bool inUse = false; // The global IOSurface use count prevents compositor reuse during scanout.
@@ -65,17 +62,15 @@ struct NativeDpuSurfaceBuffer {
 
 // NativeDpuSurfaceState owns the SM7325 display context and its page tables.
 // Initialization retains the firmware framebuffer's identity mapping, prepares
-// four empty 32 MiB IOVA ranges, then enables only the inherited display CB4.
+// two empty 32 MiB IOVA ranges, then enables only the inherited display CB4.
 // The stream-match pair, display clocks, DSI timing, mixer and backlight remain
 // owned by their existing components.
 //
-// A present reuses an inactive surface mapping or replaces the least recently
-// used inactive entry. New entries wire the descriptor and publish read-only
-// Normal NC leaves. Every present cleans the surface pages before switching
-// VIG0 through CTL0. INTF1's frame counter and the cleared CTL flush word end
-// the previous surface's read fence. Mappings survive until cache eviction or
-// firmware restoration. The display family owns producer waiting and request
-// completion; this state owns the retained mappings and scanout read fences.
+// A present wires the next IOSurface's pages, publishes read-only Normal NC
+// leaves, and switches the inherited VIG0 address through CTL0. INTF1's frame
+// counter and the cleared CTL flush word determine when the old buffer can be
+// unmapped. The table allocation uses its normal kernel mapping and explicit
+// cache cleaning; no CPU cache attribute of an IOSurface is changed.
 struct NativeDpuSurfaceState {
     IOMemoryMap *mdp = nullptr;
     IOMemoryMap *smmu = nullptr;
@@ -89,7 +84,6 @@ struct NativeDpuSurfaceState {
     uint32_t firmwareStride = 0;
     uint64_t firmwareBytes = 0;
     uint64_t sequence = 0;
-    uint64_t cacheClock = 0;
     int scanning = -1;
     unsigned operation = NoOperation;
     unsigned pendingSlot = 0;
@@ -110,8 +104,6 @@ NativeDpuSurfaceState state;
 // NativeDpuSurfaceTiming records the CPU stages and hardware frame transition
 // of one present. Durations use mach_absolute_time and are logged in microseconds.
 struct NativeDpuSurfaceTiming {
-    uint64_t producerWait = 0;
-    uint32_t producerFence = 0;
     uint64_t initialize = 0;
     uint64_t prepare = 0;
     uint64_t pages = 0;
@@ -128,125 +120,22 @@ struct NativeDpuSurfaceTiming {
 
 NativeDpuSurfaceTiming pendingTiming;
 
-enum DisplayProfileStage : unsigned {
-    DisplayMap,
-    DisplayUnmap,
-    DisplayCache,
-    DisplayProducer,
-    DisplaySubmit,
-    DisplayWait,
-    DisplayRelease,
-    DisplayTotal,
-    DisplayStageCount
-};
-
-// DisplayStageTotals accumulates elapsed mach time for one display operation.
-// Explicit profile reads convert totals and maxima to microseconds.
-struct DisplayStageTotals {
-    uint64_t count = 0;
-    uint64_t total = 0;
-    uint64_t maximum = 0;
-
-    void add(uint64_t ticks) {
-        ++count;
-        total += ticks;
-        if (ticks > maximum) {
-            maximum = ticks;
-        }
-    }
-};
-
-// DisplayProfileTotals records completed presentations and mapping operations.
-// The display work loop updates these counters under displayProfileLock; an
-// explicit USB request copies them once and prints a fixed number of rows.
-struct DisplayProfileTotals {
-    uint64_t records = 0;
-    uint64_t sequence = 0;
-    uint32_t producerFence = 0;
-    uint64_t cacheHits = 0;
-    uint64_t cacheMisses = 0;
-    uint64_t evictions = 0;
-    DisplayStageTotals stages[DisplayStageCount];
-};
-
-DisplayProfileTotals displayProfile;
-IOLock *displayProfileLock = nullptr;
-uint64_t displayProfileSnapshot = 0;
-
-void initializeDisplayProfile() {
-    if (__atomic_load_n(&displayProfileLock, __ATOMIC_ACQUIRE)) {
-        return;
-    }
-
-    IOLock *lock = IOLockAlloc();
-    __atomic_store_n(&displayProfileLock, lock, __ATOMIC_RELEASE);
-}
-
-void recordDisplayProfile(uint64_t sequence, const NativeDpuSurfaceTiming &timing) {
-    IOLock *lock = __atomic_load_n(&displayProfileLock, __ATOMIC_ACQUIRE);
-    if (!lock) {
-        return;
-    }
-
-    IOLockLock(lock);
-    ++displayProfile.records;
-    displayProfile.sequence = sequence;
-    displayProfile.producerFence = timing.producerFence;
-    displayProfile.stages[DisplayProducer].add(timing.producerWait);
-    displayProfile.stages[DisplaySubmit].add(timing.submit);
-    displayProfile.stages[DisplayWait].add(timing.wait);
-    displayProfile.stages[DisplayRelease].add(timing.release);
-    displayProfile.stages[DisplayTotal].add(timing.total);
-    IOLockUnlock(lock);
-}
-
-void recordCacheChoice(bool hit, bool eviction) {
-    IOLock *lock = __atomic_load_n(&displayProfileLock, __ATOMIC_ACQUIRE);
-    if (!lock) {
-        return;
-    }
-
-    IOLockLock(lock);
-    if (hit) {
-        ++displayProfile.cacheHits;
-    } else {
-        ++displayProfile.cacheMisses;
-    }
-    if (eviction) {
-        ++displayProfile.evictions;
-    }
-    IOLockUnlock(lock);
-}
-
-// DisplayStageDuration records every attempted map, unmap or surface clean,
-// including an operation that returns an error before completing its work.
-class DisplayStageDuration {
-    DisplayProfileStage stage;
-    uint64_t began;
-
-public:
-    explicit DisplayStageDuration(DisplayProfileStage value)
-        : stage(value), began(mach_absolute_time()) {
-    }
-
-    ~DisplayStageDuration() {
-        const uint64_t elapsed = mach_absolute_time() - began;
-        IOLock *lock = __atomic_load_n(&displayProfileLock, __ATOMIC_ACQUIRE);
-        if (!lock) {
-            return;
-        }
-
-        IOLockLock(lock);
-        displayProfile.stages[stage].add(elapsed);
-        IOLockUnlock(lock);
-    }
-};
-
 uint64_t microseconds(uint64_t ticks) {
     uint64_t nanoseconds = 0;
     absolutetime_to_nanoseconds(ticks, &nanoseconds);
 
     return nanoseconds / 1000;
+}
+
+bool logPresentTiming(uint64_t sequence) {
+    static unsigned period = 120;
+    static bool configured = false;
+    if (!configured) {
+        PE_parse_boot_argn("t733-dpu-timing", &period, sizeof(period));
+        configured = true;
+    }
+
+    return sequence <= 4 || (period && !(sequence % period));
 }
 
 IOMemoryMap *mapRegisters(uint64_t physical, uint64_t bytes) {
@@ -324,7 +213,6 @@ IOReturn cleanNormalMemory(void *mapping, uint64_t bytes) {
 }
 
 IOReturn cleanSurfacePages(IOMemoryDescriptor *memory, uint64_t bytes) {
-    DisplayStageDuration duration(DisplayCache);
     uint64_t offset = 0;
     uint64_t physical = 0;
     uint64_t segmentBytes = 0;
@@ -418,7 +306,14 @@ IOReturn synchronizeContext() {
     return kIOReturnTimeout;
 }
 
-IOReturn releaseScanoutRead(NativeDpuSurfaceBuffer &buffer) {
+IOReturn releaseBuffer(NativeDpuSurfaceBuffer &buffer) {
+    if (buffer.prepared) {
+        const IOReturn result = buffer.memory->complete(kIODirectionOut);
+        if (result != kIOReturnSuccess) {
+            return result;
+        }
+        buffer.prepared = false;
+    }
     if (buffer.fence) {
         const IOReturn result = native_legacy_surface_fence_complete(buffer.fence, kIOReturnSuccess);
         if (result != kIOReturnSuccess) {
@@ -429,23 +324,6 @@ IOReturn releaseScanoutRead(NativeDpuSurfaceBuffer &buffer) {
     if (buffer.inUse) {
         native_legacy_surface_decrement_use(buffer.surface);
         buffer.inUse = false;
-    }
-
-    return kIOReturnSuccess;
-}
-
-IOReturn releaseBuffer(NativeDpuSurfaceBuffer &buffer) {
-    if (buffer.prepared) {
-        const IOReturn result = buffer.memory->complete(kIODirectionOut);
-        if (result != kIOReturnSuccess) {
-            return result;
-        }
-        buffer.prepared = false;
-    }
-
-    const IOReturn result = releaseScanoutRead(buffer);
-    if (result != kIOReturnSuccess) {
-        return result;
     }
 
     OSSafeReleaseNULL(buffer.memory);
@@ -652,7 +530,6 @@ IOReturn initialize() {
 
 IOReturn mapBuffer(unsigned slot, OSObject *surface, IOMemoryDescriptor *memory,
     uint64_t stride, uint32_t height, NativeDpuSurfaceTiming &timing) {
-    DisplayStageDuration duration(DisplayMap);
     const uint64_t began = mach_absolute_time();
     const uint64_t bytes = stride * height;
     const uint64_t mappedBytes = (bytes + PageBytes - 1) & ~(PageBytes - 1);
@@ -675,6 +552,8 @@ IOReturn mapBuffer(unsigned slot, OSObject *surface, IOMemoryDescriptor *memory,
         return result;
     }
     buffer.prepared = true;
+    native_legacy_surface_increment_use(surface);
+    buffer.inUse = true;
     const uint64_t prepared = mach_absolute_time();
     timing.prepare = prepared - began;
 
@@ -693,11 +572,20 @@ IOReturn mapBuffer(unsigned slot, OSObject *surface, IOMemoryDescriptor *memory,
     const uint64_t pages = mach_absolute_time();
     timing.pages = pages - prepared;
 
+    result = cleanSurfacePages(memory, mappedBytes);
+    if (result != kIOReturnSuccess) {
+        bzero(leaves, SurfaceTablePages * PageBytes);
+        releaseBuffer(buffer);
+        return result;
+    }
+    const uint64_t cleaned = mach_absolute_time();
+    timing.clean = cleaned - pages;
+
     result = cleanNormalMemory(leaves, SurfaceTablePages * PageBytes);
     if (result == kIOReturnSuccess) {
         result = synchronizeContext();
     }
-    timing.tables = mach_absolute_time() - pages;
+    timing.tables = mach_absolute_time() - cleaned;
 
     return result;
 }
@@ -708,7 +596,6 @@ IOReturn unmapBuffer(unsigned slot) {
         return kIOReturnSuccess;
     }
 
-    DisplayStageDuration duration(DisplayUnmap);
     uint64_t *leaves = surfaceLeaves(slot);
     bzero(leaves, SurfaceTablePages * PageBytes);
     IOReturn result = cleanNormalMemory(leaves, SurfaceTablePages * PageBytes);
@@ -720,68 +607,6 @@ IOReturn unmapBuffer(unsigned slot) {
     }
 
     return releaseBuffer(buffer);
-}
-
-// An inactive mapping can be reused without preparing the descriptor again.
-// Eviction keeps the current and pending scanout addresses mapped until their
-// hardware switch completes; a retained read fence also prevents eviction.
-IOReturn selectBuffer(OSObject *surface, IOMemoryDescriptor *memory,
-    uint64_t stride, uint32_t height, NativeDpuSurfaceTiming &timing, unsigned *selected) {
-    const uint64_t bytes = stride * height;
-    const uint64_t mappedBytes = (bytes + PageBytes - 1) & ~(PageBytes - 1);
-    int candidate = -1;
-    for (unsigned slot = 0; slot < SurfaceCount; ++slot) {
-        if (static_cast<int>(slot) == state.scanning ||
-            (state.operation == SurfaceOperation && slot == state.pendingSlot)) {
-            continue;
-        }
-
-        NativeDpuSurfaceBuffer &buffer = state.buffers[slot];
-        if (buffer.fence || buffer.inUse) {
-            continue;
-        }
-        if (buffer.prepared && buffer.surface == surface && buffer.memory == memory &&
-            buffer.bytes == mappedBytes && buffer.stride == stride) {
-            buffer.lastUsed = ++state.cacheClock;
-            *selected = slot;
-            recordCacheChoice(true, false);
-
-            return kIOReturnSuccess;
-        }
-        if (candidate < 0 || !buffer.memory ||
-            (state.buffers[candidate].memory && buffer.lastUsed < state.buffers[candidate].lastUsed)) {
-            candidate = static_cast<int>(slot);
-        }
-    }
-
-    if (candidate < 0) {
-        recordCacheChoice(false, false);
-        return kIOReturnNoResources;
-    }
-
-    const unsigned slot = static_cast<unsigned>(candidate);
-    const bool eviction = state.buffers[slot].memory != nullptr;
-    recordCacheChoice(false, eviction);
-    if (eviction) {
-        const IOReturn result = unmapBuffer(slot);
-        if (result != kIOReturnSuccess) {
-            state.failed = true;
-            return result;
-        }
-    }
-
-    const IOReturn result = mapBuffer(slot, surface, memory, stride, height, timing);
-    if (result != kIOReturnSuccess) {
-        if (state.buffers[slot].memory) {
-            state.failed = true;
-        }
-        return result;
-    }
-
-    state.buffers[slot].lastUsed = ++state.cacheClock;
-    *selected = slot;
-
-    return kIOReturnSuccess;
 }
 
 void submitAddress(uint32_t address, uint32_t stride) {
@@ -809,49 +634,8 @@ extern "C" bool t733_dpu_surface_active(void) {
     return state.scanning >= 0;
 }
 
-extern "C" void native_display_profile_dump(void) {
-    IOLock *lock = __atomic_load_n(&displayProfileLock, __ATOMIC_ACQUIRE);
-    if (!lock) {
-        return;
-    }
-
-    IOLockLock(lock);
-    const uint64_t snapshot = ++displayProfileSnapshot;
-    const DisplayProfileTotals totals = displayProfile;
-    IOLockUnlock(lock);
-
-    IOLog("NativeAdrenoProfile: kind=display-summary snapshot=%llu records=%llu lost=0 cache_hits=%llu cache_misses=%llu evictions=%llu seq=%llu fence=%u\n",
-        snapshot, totals.records, totals.cacheHits, totals.cacheMisses, totals.evictions,
-        totals.sequence, totals.producerFence);
-
-    static const char *const names[DisplayStageCount] = {
-        "map", "unmap", "cache", "producer", "submit", "wait", "release", "total"
-    };
-    for (unsigned stage = 0; stage < DisplayStageCount; ++stage) {
-        const DisplayStageTotals &duration = totals.stages[stage];
-        IOLog("NativeAdrenoProfile: kind=display-stage snapshot=%llu stage=%s count=%llu total_us=%llu max_us=%llu\n",
-            snapshot, names[stage], duration.count, microseconds(duration.total),
-            microseconds(duration.maximum));
-    }
-}
-
 extern "C" bool t733_dpu_surface_pending(void) {
     return state.operation != NoOperation;
-}
-
-extern "C" IOReturn t733_dpu_surface_frame(uint32_t *frame) {
-    if (!frame) {
-        return kIOReturnBadArgument;
-    }
-    *frame = 0;
-    if (!state.mdp) {
-        return kIOReturnNotReady;
-    }
-    if (!(read32(state.mdp, Interface) & 1)) {
-        return kIOReturnOffline;
-    }
-    *frame = read32(state.mdp, Interface + 0xac);
-    return kIOReturnSuccess;
 }
 
 extern "C" bool t733_dpu_surface_timing_enabled(void) {
@@ -871,7 +655,7 @@ extern "C" bool t733_dpu_surface_timing_enabled(void) {
 
 extern "C" IOReturn t733_dpu_surface_begin(OSObject *surface,
     IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height,
-    OSObject *fence, uint32_t producerFence, uint64_t producerWaitTicks) {
+    OSObject *fence) {
     if (!t733_dpu_surface_enabled()) {
         return kIOReturnUnsupported;
     }
@@ -883,10 +667,7 @@ extern "C" IOReturn t733_dpu_surface_begin(OSObject *surface,
         return state.failed ? kIOReturnNotResponding : kIOReturnBadArgument;
     }
 
-    initializeDisplayProfile();
     pendingTiming = {};
-    pendingTiming.producerFence = producerFence;
-    pendingTiming.producerWait = producerWaitTicks;
     state.presentBegan = mach_absolute_time();
     IOReturn result = initialize();
     if (result != kIOReturnSuccess) {
@@ -894,26 +675,22 @@ extern "C" IOReturn t733_dpu_surface_begin(OSObject *surface,
     }
     pendingTiming.initialize = mach_absolute_time() - state.presentBegan;
 
-    unsigned next = 0;
-    result = selectBuffer(surface, memory, stride, height, pendingTiming, &next);
+    const unsigned next = state.scanning == 0 ? 1 : 0;
+    result = mapBuffer(next, surface, memory, stride, height, pendingTiming);
     if (result != kIOReturnSuccess) {
+        if (state.buffers[next].memory) {
+            state.failed = true;
+        }
         return result;
     }
 
     NativeDpuSurfaceBuffer &buffer = state.buffers[next];
-    if (!fence) {
-        native_legacy_surface_increment_use(buffer.surface);
-        buffer.inUse = true;
-    }
-
-    const uint64_t cleanBegan = mach_absolute_time();
-    result = cleanSurfacePages(memory, buffer.bytes);
-    pendingTiming.clean = mach_absolute_time() - cleanBegan;
-    if (result != kIOReturnSuccess) {
-        return result;
-    }
-
     buffer.fence = fence;
+    if (fence && buffer.inUse) {
+        native_legacy_surface_decrement_use(buffer.surface);
+        buffer.inUse = false;
+    }
+
     state.pendingSlot = next;
     state.operation = SurfaceOperation;
     submitAddress(SurfaceIova + next * SurfaceBytes, static_cast<uint32_t>(stride));
@@ -976,7 +753,7 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
         state.scanning = static_cast<int>(state.pendingSlot);
         state.operation = NoOperation;
         if (previous >= 0) {
-            const IOReturn result = releaseScanoutRead(state.buffers[previous]);
+            const IOReturn result = unmapBuffer(static_cast<unsigned>(previous));
             if (result != kIOReturnSuccess) {
                 state.failed = true;
                 return result;
@@ -987,7 +764,15 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
         pendingTiming.poll += mach_absolute_time() - began;
 
         ++state.sequence;
-        recordDisplayProfile(state.sequence, pendingTiming);
+        if (logPresentTiming(state.sequence)) {
+            IOLog("T733 DPU surface: flip=%llu iova=%x stride=%u frame=%u previous=%d asynchronous=1\n",
+                state.sequence, state.pendingAddress, state.buffers[state.scanning].stride, frame, previous);
+            IOLog("T733 DPU surface: us total=%llu submit=%llu poll=%llu init=%llu prepare=%llu pages=%llu clean=%llu tables=%llu wait=%llu release=%llu frames=%u,%u\n",
+                microseconds(pendingTiming.total), microseconds(pendingTiming.submit), microseconds(pendingTiming.poll),
+                microseconds(pendingTiming.initialize), microseconds(pendingTiming.prepare), microseconds(pendingTiming.pages),
+                microseconds(pendingTiming.clean), microseconds(pendingTiming.tables), microseconds(pendingTiming.wait),
+                microseconds(pendingTiming.release), pendingTiming.frameBefore, pendingTiming.frameAfter);
+        }
 
         return kIOReturnSuccess;
     }

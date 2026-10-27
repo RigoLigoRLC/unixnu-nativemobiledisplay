@@ -184,7 +184,7 @@ extern "C" void native_legacy_frame_profile_dump(void) {
     for (uint32_t index = 0; index < count; ++index) {
         const NativeLegacyFrameObservation &frame = snapshot[index];
         const NativeAdrenoSurfaceProfile &gpu = frame.gpu;
-        IOLog("T733 frame-profile: sequence=%llu frame_id=%u completion=%u status=%x queued=%u valid=%u gpu_status=%x gpu_flags=%u composition_start_us=%llu swap_issued_us=%llu requested_presentation_us=%llu accepted_us=%llu read_fence_active_us=%llu producer_wait_us=%llu producer_ready_us=%llu dpu_submit_us=%llu display_lower_us=%llu display_upper_us=%llu dpu_frame=%u dpu_source=%u captured_fence=%u first_fence=%u last_fence=%u submissions=%u exact_submissions=%u fallback_submissions=%u first_submit_us=%llu last_submit_us=%llu gpu_complete_observed_us=%llu stored_submissions=%u\n",
+        IOLog("T733 frame-profile: sequence=%llu frame_id=%u completion=%u status=%x queued=%u valid=%u gpu_status=%x gpu_flags=%u composition_start_us=%llu swap_issued_us=%llu requested_presentation_us=%llu accepted_us=%llu read_fence_active_us=%llu producer_wait_us=%llu producer_ready_us=%llu dpu_submit_us=%llu display_lower_us=%llu display_upper_us=%llu dpu_frame=%u dpu_source=%u captured_fence=%u first_fence=%u last_fence=%u submissions=%u exact_submissions=%u fallback_submissions=%u first_submit_us=%llu last_submit_us=%llu gpu_complete_observed_us=%llu stored_submissions=%u match_cache_hit=%u match_segments=%u match_us=%llu\n",
             frame.sequence, frame.frameID, frame.completion, frame.status,
             frame.queued, frame.validity, frame.gpuStatus, gpu.flags,
             nativeFrameMicroseconds(frame.compositionStart),
@@ -200,7 +200,8 @@ extern "C" void native_legacy_frame_profile_dump(void) {
             frame.presentation.frameCount, frame.presentation.source,
             frame.capturedFence, gpu.firstFence, gpu.lastFence, gpu.submissions,
             gpu.exactSubmissions, gpu.fallbackSubmissions, gpu.firstSubmitUs,
-            gpu.lastSubmitUs, gpu.completeObservedUs, gpu.storedSubmissions);
+            gpu.lastSubmitUs, gpu.completeObservedUs, gpu.storedSubmissions,
+            gpu.matchCacheHit, gpu.matchSegments, gpu.matchUs);
         for (uint32_t writer = 0; writer < gpu.storedSubmissions; ++writer) {
             IOLog("T733 frame-write: sequence=%llu index=%u fence=%u submit_sequence=%u\n",
                 frame.sequence, writer, gpu.fences[writer], gpu.sequences[writer]);

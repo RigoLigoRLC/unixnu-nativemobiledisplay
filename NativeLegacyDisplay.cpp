@@ -79,6 +79,20 @@ extern "C" void native_legacy_frame_info_notify(void *display,
 extern "C" bool native_legacy_set_refresh_properties(void *display);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
 extern "C" uint64_t mach_continuous_time(void);
+
+// NativeLegacyFrameInfoSender sends a subscription's async reference and frame
+// arguments through IOKit's finite queue. The display records the send result.
+class NativeLegacyFrameInfoSender final : private IOUserClient {
+    NativeLegacyFrameInfoSender() = delete;
+
+public:
+    static IOReturn send(OSAsyncReference64 reference, io_user_reference_t arguments[],
+        UInt32 count) {
+        return sendAsyncResult64WithOptions(reference, kIOReturnSuccess, arguments,
+            count, kIOUserNotifyOptionCanDrop);
+    }
+};
+
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -1831,8 +1845,8 @@ public:
 
         auto bytes = reinterpret_cast<unsigned char *>(subscription);
         auto reference = reinterpret_cast<io_user_reference_t *>(bytes + 0x18);
-        const IOReturn result = IOUserClient::sendAsyncResult64WithOptions(reference,
-            kIOReturnSuccess, arguments, count, kIOUserNotifyOptionCanDrop);
+        const IOReturn result = NativeLegacyFrameInfoSender::send(reference, arguments,
+            count);
         frameInfoStatistics.lastSendResult = result;
         if (result == kIOReturnSuccess) {
             ++frameInfoStatistics.sent;

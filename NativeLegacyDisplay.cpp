@@ -184,23 +184,38 @@ extern "C" void native_legacy_frame_profile_dump(void) {
     for (uint32_t index = 0; index < count; ++index) {
         const NativeLegacyFrameObservation &frame = snapshot[index];
         const NativeAdrenoSurfaceProfile &gpu = frame.gpu;
-        IOLog("T733 frame-profile: sequence=%llu frame_id=%u completion=%u status=%x queued=%u valid=%u gpu_status=%x gpu_flags=%u composition_start_us=%llu swap_issued_us=%llu requested_presentation_us=%llu accepted_us=%llu read_fence_active_us=%llu producer_wait_us=%llu producer_ready_us=%llu dpu_submit_us=%llu display_lower_us=%llu display_upper_us=%llu dpu_frame=%u dpu_source=%u captured_fence=%u first_fence=%u last_fence=%u submissions=%u exact_submissions=%u fallback_submissions=%u first_submit_us=%llu last_submit_us=%llu gpu_complete_observed_us=%llu stored_submissions=%u match_cache_hit=%u match_segments=%u match_us=%llu\n",
+        IOLog("T733 frame-profile: sequence=%llu part=0 parts=9 frame_id=%u completion=%u status=%x queued=%u valid=%u gpu_status=%x gpu_flags=%u\n",
             frame.sequence, frame.frameID, frame.completion, frame.status,
-            frame.queued, frame.validity, frame.gpuStatus, gpu.flags,
+            frame.queued, frame.validity, frame.gpuStatus, gpu.flags);
+        IOLog("T733 frame-profile: sequence=%llu part=1 composition_start_us=%llu swap_issued_us=%llu\n",
+            frame.sequence,
             nativeFrameMicroseconds(frame.compositionStart),
-            nativeFrameMicroseconds(frame.issuedTime),
+            nativeFrameMicroseconds(frame.issuedTime));
+        IOLog("T733 frame-profile: sequence=%llu part=2 requested_presentation_us=%llu accepted_us=%llu\n",
+            frame.sequence,
             nativeFrameMicroseconds(frame.requestedTime),
-            nativeFrameMicroseconds(frame.acceptedTime),
+            nativeFrameMicroseconds(frame.acceptedTime));
+        IOLog("T733 frame-profile: sequence=%llu part=3 read_fence_active_us=%llu producer_wait_us=%llu producer_ready_us=%llu\n",
+            frame.sequence,
             nativeFrameMicroseconds(frame.readFenceActiveTime),
             nativeFrameMicroseconds(frame.producerWaitTime),
-            nativeFrameMicroseconds(frame.producerReadyTime),
+            nativeFrameMicroseconds(frame.producerReadyTime));
+        IOLog("T733 frame-profile: sequence=%llu part=4 dpu_submit_us=%llu display_lower_us=%llu display_upper_us=%llu\n",
+            frame.sequence,
             nativeFrameMicroseconds(frame.presentation.submittedTime),
             nativeFrameMicroseconds(frame.presentation.lowerBound),
-            nativeFrameMicroseconds(frame.presentation.upperBound),
+            nativeFrameMicroseconds(frame.presentation.upperBound));
+        IOLog("T733 frame-profile: sequence=%llu part=5 dpu_frame=%u dpu_source=%u captured_fence=%u first_fence=%u last_fence=%u\n",
+            frame.sequence,
             frame.presentation.frameCount, frame.presentation.source,
-            frame.capturedFence, gpu.firstFence, gpu.lastFence, gpu.submissions,
-            gpu.exactSubmissions, gpu.fallbackSubmissions, gpu.firstSubmitUs,
-            gpu.lastSubmitUs, gpu.completeObservedUs, gpu.storedSubmissions,
+            frame.capturedFence, gpu.firstFence, gpu.lastFence);
+        IOLog("T733 frame-profile: sequence=%llu part=6 submissions=%u exact_submissions=%u fallback_submissions=%u stored_submissions=%u\n",
+            frame.sequence, gpu.submissions, gpu.exactSubmissions,
+            gpu.fallbackSubmissions, gpu.storedSubmissions);
+        IOLog("T733 frame-profile: sequence=%llu part=7 first_submit_us=%llu last_submit_us=%llu gpu_complete_observed_us=%llu\n",
+            frame.sequence, gpu.firstSubmitUs, gpu.lastSubmitUs, gpu.completeObservedUs);
+        IOLog("T733 frame-profile: sequence=%llu part=8 match_cache_hit=%u match_segments=%u match_us=%llu\n",
+            frame.sequence,
             gpu.matchCacheHit, gpu.matchSegments, gpu.matchUs);
         for (uint32_t writer = 0; writer < gpu.storedSubmissions; ++writer) {
             IOLog("T733 frame-write: sequence=%llu index=%u fence=%u submit_sequence=%u\n",

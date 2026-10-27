@@ -18,6 +18,7 @@ enum : uint32_t {
 struct NativeDpuPresentation {
     uint64_t lowerBound; // A time before submission or a read of pending flush.
     uint64_t upperBound; // The software presentation estimate, not a hardware latch.
+    uint64_t submittedTime; // A sample immediately before the CTL0 flush write.
     uint32_t frameCount;
     uint32_t source;
 };

@@ -6,6 +6,7 @@
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
 #include "OriginalAppleARMBacklightABI.h"
 #include "NativeDpuSurface.h"
+#include "../Adreno6xx/NativeAdrenoDisplay.h"
 #endif
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
@@ -57,6 +58,9 @@ extern "C" IOReturn native_adreno_capture_surface_producer(uint32_t *capturedFen
     __attribute__((weak_import));
 extern "C" IOReturn native_adreno_poll_surface_producer(uint32_t capturedFence)
     __attribute__((weak_import));
+extern "C" IOReturn native_adreno_surface_profile_capture(IOMemoryDescriptor *memory,
+    uint32_t capturedFence, uint64_t compositionStartContinuousUs,
+    NativeAdrenoSurfaceProfile *result) __attribute__((weak_import));
 #endif
 extern "C" void native_legacy_retirement_observed(IOService *);
 // The privileged GPU client accepts frames with sheng-fb-gpu=1 and owns their
@@ -79,6 +83,133 @@ extern "C" void native_legacy_frame_info_notify(void *display,
 extern "C" bool native_legacy_set_refresh_properties(void *display);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
 extern "C" uint64_t mach_continuous_time(void);
+
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+enum : uint32_t {
+    NativeFrameCompositionStartValid = 1U,
+    NativeFrameIssuedValid = 2U,
+    NativeFrameRequestedValid = 4U,
+    NativeFrameAcceptedValid = 8U,
+    NativeFrameReadFenceActiveValid = 16U,
+    NativeFrameProducerReadyValid = 32U,
+    NativeFrameGpuMetadataValid = 64U,
+    NativeFramePresentationValid = 128U,
+    NativeFrameProfileCapacity = 512U
+};
+
+// NativeLegacyFrameObservation joins the native swap's composition timestamp
+// and ID to source-writing GPU submissions and the DPU switch interval. The
+// display gate fills one record while retaining the swap request. The completed
+// record owns values only, so the diagnostic history retains no surface or fence.
+struct NativeLegacyFrameObservation {
+    uint64_t sequence = 0;
+    uint64_t compositionStart = 0;
+    uint64_t issuedTime = 0;
+    uint64_t requestedTime = 0;
+    uint64_t acceptedTime = 0;
+    uint64_t readFenceActiveTime = 0;
+    uint64_t producerWaitTime = 0;
+    uint64_t producerReadyTime = 0;
+    uint32_t frameID = 0;
+    uint32_t completion = 0;
+    uint32_t validity = 0;
+    uint32_t capturedFence = 0; // The global safety wait may include other surfaces.
+    bool queued = false;
+    IOReturn status = kIOReturnSuccess;
+    IOReturn gpuStatus = kIOReturnUnsupported;
+    NativeDpuPresentation presentation = {};
+    NativeAdrenoSurfaceProfile gpu = {}; // Its timestamps already use continuous microseconds.
+};
+
+static NativeLegacyFrameObservation nativeFrameHistory[NativeFrameProfileCapacity];
+static uint32_t nativeFrameHistoryLock;
+static uint32_t nativeFrameHistoryNext;
+static uint32_t nativeFrameHistoryCount;
+static uint64_t nativeFrameHistorySequence;
+static uint64_t nativeFrameHistoryOverwritten;
+
+static void nativeFrameHistoryEnter() {
+    while (__atomic_test_and_set(&nativeFrameHistoryLock, __ATOMIC_ACQUIRE)) {
+    }
+}
+
+static void nativeFrameHistoryLeave() {
+    __atomic_clear(&nativeFrameHistoryLock, __ATOMIC_RELEASE);
+}
+
+static uint64_t nativeFrameMicroseconds(uint64_t ticks) {
+    uint64_t nanoseconds = 0;
+    absolutetime_to_nanoseconds(ticks, &nanoseconds);
+
+    return nanoseconds / 1000;
+}
+
+static bool nativeFrameRemember(NativeLegacyFrameObservation &observation) {
+    nativeFrameHistoryEnter();
+    observation.sequence = ++nativeFrameHistorySequence;
+    nativeFrameHistory[nativeFrameHistoryNext] = observation;
+    nativeFrameHistoryNext = (nativeFrameHistoryNext + 1) % NativeFrameProfileCapacity;
+    const bool overwritten = nativeFrameHistoryCount == NativeFrameProfileCapacity;
+    if (overwritten) {
+        ++nativeFrameHistoryOverwritten;
+    } else {
+        ++nativeFrameHistoryCount;
+    }
+    nativeFrameHistoryLeave();
+
+    return overwritten;
+}
+
+extern "C" void native_legacy_frame_profile_dump(void) {
+    const size_t snapshotBytes = sizeof(nativeFrameHistory);
+    auto snapshot = static_cast<NativeLegacyFrameObservation *>(IOMalloc(snapshotBytes));
+    if (!snapshot) {
+        IOLog("T733 frame-profile-summary: allocation_failed=1\n");
+        return;
+    }
+
+    nativeFrameHistoryEnter();
+    const uint32_t count = nativeFrameHistoryCount;
+    const uint32_t first = (nativeFrameHistoryNext + NativeFrameProfileCapacity - count) %
+        NativeFrameProfileCapacity;
+    const uint64_t overwritten = nativeFrameHistoryOverwritten;
+    const uint64_t sequence = nativeFrameHistorySequence;
+    for (uint32_t index = 0; index < count; ++index) {
+        snapshot[index] = nativeFrameHistory[(first + index) % NativeFrameProfileCapacity];
+    }
+    nativeFrameHistoryLeave();
+
+    IOLog("T733 frame-profile-summary: clock=continuous units=us capacity=%u count=%u overwritten=%llu latest_sequence=%llu\n",
+        NativeFrameProfileCapacity, count, overwritten, sequence);
+    for (uint32_t index = 0; index < count; ++index) {
+        const NativeLegacyFrameObservation &frame = snapshot[index];
+        const NativeAdrenoSurfaceProfile &gpu = frame.gpu;
+        IOLog("T733 frame-profile: sequence=%llu frame_id=%u completion=%u status=%x queued=%u valid=%u gpu_status=%x gpu_flags=%u composition_start_us=%llu swap_issued_us=%llu requested_presentation_us=%llu accepted_us=%llu read_fence_active_us=%llu producer_wait_us=%llu producer_ready_us=%llu dpu_submit_us=%llu display_lower_us=%llu display_upper_us=%llu dpu_frame=%u dpu_source=%u captured_fence=%u first_fence=%u last_fence=%u submissions=%u exact_submissions=%u fallback_submissions=%u first_submit_us=%llu last_submit_us=%llu gpu_complete_observed_us=%llu stored_submissions=%u\n",
+            frame.sequence, frame.frameID, frame.completion, frame.status,
+            frame.queued, frame.validity, frame.gpuStatus, gpu.flags,
+            nativeFrameMicroseconds(frame.compositionStart),
+            nativeFrameMicroseconds(frame.issuedTime),
+            nativeFrameMicroseconds(frame.requestedTime),
+            nativeFrameMicroseconds(frame.acceptedTime),
+            nativeFrameMicroseconds(frame.readFenceActiveTime),
+            nativeFrameMicroseconds(frame.producerWaitTime),
+            nativeFrameMicroseconds(frame.producerReadyTime),
+            nativeFrameMicroseconds(frame.presentation.submittedTime),
+            nativeFrameMicroseconds(frame.presentation.lowerBound),
+            nativeFrameMicroseconds(frame.presentation.upperBound),
+            frame.presentation.frameCount, frame.presentation.source,
+            frame.capturedFence, gpu.firstFence, gpu.lastFence, gpu.submissions,
+            gpu.exactSubmissions, gpu.fallbackSubmissions, gpu.firstSubmitUs,
+            gpu.lastSubmitUs, gpu.completeObservedUs, gpu.storedSubmissions);
+        for (uint32_t writer = 0; writer < gpu.storedSubmissions; ++writer) {
+            IOLog("T733 frame-write: sequence=%llu index=%u fence=%u submit_sequence=%u\n",
+                frame.sequence, writer, gpu.fences[writer], gpu.sequences[writer]);
+        }
+    }
+
+    IOFree(snapshot, snapshotBytes);
+}
+#endif
 
 // NativeLegacyFrameInfoSender sends a subscription's async reference and frame
 // arguments through IOKit's finite queue. The display records the send result.
@@ -408,7 +539,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     static constexpr uint32_t FrameInfoRequestedMask = 2U;
     static constexpr uint32_t FrameInfoSupportedMask =
         FrameInfoPresentationMask | FrameInfoRequestedMask;
-    static constexpr unsigned FrameInfoHistoryCapacity = 64;
 
     // FrameInfoStatistics accounts for presentation, report ownership and
     // delivery separately. The display work-loop gate serializes every update.
@@ -433,23 +563,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         IOReturn lastSendResult = kIOReturnSuccess;
     };
 
-    // FrameInfoObservation retains the requested time and DPU observation
-    // interval for a completed swap after the family releases its request.
-    struct FrameInfoObservation {
-        uint64_t sequence;
-        uint64_t issuedTime;
-        uint64_t requestedTime;
-        uint64_t lowerBound;
-        uint64_t upperBound;
-        uint32_t frameID;
-        uint32_t frameCount;
-        uint32_t source;
-    };
-
     FrameInfoStatistics frameInfoStatistics;
-    FrameInfoObservation frameInfoHistory[FrameInfoHistoryCapacity] = {};
-    unsigned frameInfoHistoryNext = 0;
-    unsigned frameInfoHistoryCount = 0;
     uint64_t frameInfoSummaryDeadline = 0;
     OriginalLegacyFrameReport pendingFrameInfo = {};
     bool pendingFrameInfoValid = false;
@@ -523,19 +637,6 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             frameInfoStatistics.uncertaintyMaximum = uncertainty;
         }
 
-        FrameInfoObservation &observation = frameInfoHistory[frameInfoHistoryNext];
-        observation = {
-            frameInfoStatistics.generated, pendingFrameInfo.issuedTime(),
-            pendingFrameInfo.requestedPresentation(), presentation.lowerBound,
-            presentation.upperBound, pendingFrameInfo.frameID(), presentation.frameCount,
-            presentation.source
-        };
-        frameInfoHistoryNext = (frameInfoHistoryNext + 1) % FrameInfoHistoryCapacity;
-        if (frameInfoHistoryCount < FrameInfoHistoryCapacity) {
-            ++frameInfoHistoryCount;
-        } else {
-            ++frameInfoStatistics.historyOverwritten;
-        }
     }
 
     NativeT733Backlight *backlight = nullptr;
@@ -687,16 +788,45 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // (int-131: swap 3 was validated during swap 2's GPU copy and one remembered pointer lost swap 2, which then never retired and left
     // every wait on it busy), so more than one can be pending.
     const OriginalLegacySwapRequest *validated[8]={};
+    uint64_t validatedTime[8] = {};
     bool isValidated(const OriginalLegacySwapRequest *request) const {
         if(!request)return false;
         for(auto entry: validated)if(entry==request)return true;
         return false;
     }
-    void removeValidated(const OriginalLegacySwapRequest *request) {for(auto &entry: validated)if(entry==request)entry=nullptr;}
+    void removeValidated(const OriginalLegacySwapRequest *request) {
+        for (unsigned index = 0; index < 8; ++index) {
+            if (validated[index] == request) {
+                validated[index] = nullptr;
+                validatedTime[index] = 0;
+            }
+        }
+    }
+
     void addValidated(const OriginalLegacySwapRequest *request) {
-        if(isValidated(request))return;
-        for(auto &entry: validated)if(!entry){entry=request;return;}
-        validated[0]=request;
+        if (isValidated(request)) {
+            return;
+        }
+
+        unsigned slot = 0;
+        for (unsigned index = 0; index < 8; ++index) {
+            if (!validated[index]) {
+                slot = index;
+                break;
+            }
+        }
+        validated[slot] = request;
+        validatedTime[slot] = mach_continuous_time();
+    }
+
+    uint64_t validationTime(const OriginalLegacySwapRequest *request) const {
+        for (unsigned index = 0; index < 8; ++index) {
+            if (validated[index] == request) {
+                return validatedTime[index];
+            }
+        }
+
+        return 0;
     }
     const OriginalLegacySwapRequest *gpuRequest=nullptr;
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
@@ -711,11 +841,14 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool surfaceTimerAdded = false;
     bool producerTimerAdded = false;
 
-    // The producer work loop owns capture and cache acquisition. The display
+    // The producer work loop owns capture and GPU completion polling. The display
     // gate owns producerRequest and consumes the result under producerLock.
     // A generation change discards an in-flight result after request cancel.
     uint64_t producerGeneration = 0;
     uint32_t producerFence = 0;
+    uint64_t producerReadFenceActiveTime = 0;
+    uint64_t producerWaitTime = 0;
+    uint64_t producerReadyTime = 0;
     IOReturn producerResult = kIOReturnNotReady;
     bool producerPending = false;
     bool producerCaptured = false;
@@ -734,6 +867,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool dpuRestoring = false;
     uint64_t dpuLength = 0;
     IOReturn dpuResult = kIOReturnSuccess;
+    NativeLegacyFrameObservation dpuFrameObservation;
 
     static OSObject *requestObject(const OriginalLegacySwapRequest *request) {
         return reinterpret_cast<OSObject *>(const_cast<OriginalLegacySwapRequest *>(request));
@@ -752,6 +886,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             producerPending = false;
             producerDone = false;
             producerCaptured = false;
+            producerReadyTime = 0;
             IOLockUnlock(producerLock);
         }
 
@@ -795,6 +930,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             producerCaptured = captured;
             producerFence = fence;
             if (result != kIOReturnTimeout && result != kIOReturnNotReady) {
+                producerReadyTime = result == kIOReturnSuccess ? mach_continuous_time() : 0;
                 producerResult = result;
                 producerDone = true;
                 producerPending = false;
@@ -815,8 +951,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             clearProducerRequest();
             requestObject(request)->retain();
             producerRequest = request;
+            producerReadFenceActiveTime = layerZeroFence(request) ? mach_continuous_time() : 0;
 
             IOLockLock(producerLock);
+            producerWaitTime = mach_continuous_time();
             producerFence = 0;
             producerResult = kIOReturnNotReady;
             producerPending = true;
@@ -855,6 +993,46 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         dpuLength = length;
         dpuResult = kIOReturnSuccess;
         transferred = true;
+
+        OriginalLegacyFrameReport report = {};
+        report.setPresentation(request, 0);
+        dpuFrameObservation = {};
+        dpuFrameObservation.frameID = report.frameID();
+        dpuFrameObservation.completion = completion;
+        dpuFrameObservation.compositionStart =
+            OriginalLegacyFrameReport::compositionStartTime(request);
+        dpuFrameObservation.issuedTime = report.issuedTime();
+        dpuFrameObservation.requestedTime = report.requestedPresentation();
+        dpuFrameObservation.acceptedTime = validationTime(request);
+        const uint64_t now = mach_continuous_time();
+        if (dpuFrameObservation.issuedTime && dpuFrameObservation.issuedTime <= now) {
+            dpuFrameObservation.validity |= NativeFrameIssuedValid;
+        }
+        if (dpuFrameObservation.compositionStart &&
+            dpuFrameObservation.compositionStart <= dpuFrameObservation.issuedTime &&
+            (dpuFrameObservation.validity & NativeFrameIssuedValid)) {
+            dpuFrameObservation.validity |= NativeFrameCompositionStartValid;
+        }
+        if (dpuFrameObservation.requestedTime) {
+            dpuFrameObservation.validity |= NativeFrameRequestedValid;
+        }
+        if (dpuFrameObservation.acceptedTime && dpuFrameObservation.acceptedTime <= now) {
+            dpuFrameObservation.validity |= NativeFrameAcceptedValid;
+        }
+        if (producerRequest == request) {
+            IOLockLock(producerLock);
+            dpuFrameObservation.readFenceActiveTime = producerReadFenceActiveTime;
+            dpuFrameObservation.producerWaitTime = producerWaitTime;
+            dpuFrameObservation.producerReadyTime = producerReadyTime;
+            dpuFrameObservation.capturedFence = producerFence;
+            IOLockUnlock(producerLock);
+            if (dpuFrameObservation.readFenceActiveTime) {
+                dpuFrameObservation.validity |= NativeFrameReadFenceActiveValid;
+            }
+            if (dpuFrameObservation.producerReadyTime) {
+                dpuFrameObservation.validity |= NativeFrameProducerReadyValid;
+            }
+        }
     }
 
     void completeDpuRequest() {
@@ -870,6 +1048,19 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         NativeDpuPresentation presentation = {};
         const bool hasPresentation = t733_dpu_surface_take_presentation(&presentation);
         const bool queued = request && pendingSwapRequest() == request && isValidated(request);
+        if (request) {
+            dpuFrameObservation.completion = completion;
+            dpuFrameObservation.status = result;
+            dpuFrameObservation.queued = queued;
+            if (hasPresentation) {
+                dpuFrameObservation.presentation = presentation;
+                dpuFrameObservation.validity |= NativeFramePresentationValid;
+            }
+            if (nativeFrameRemember(dpuFrameObservation)) {
+                ++frameInfoStatistics.historyOverwritten;
+            }
+            dpuFrameObservation = {};
+        }
         if (completion == SurfaceCompletion && result == kIOReturnSuccess) {
             ++frameInfoStatistics.completed;
             if (!hasPresentation) {
@@ -965,7 +1156,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         producerLock = IOLockAlloc();
         producerLoop = IOWorkLoop::workLoop();
         surfaceTimer = IOTimerEventSource::timerEventSource(this, &NativeLegacyDisplay::surfaceFired);
-        // Producer cache acquisition runs on producerLoop's thread. Default
+        // Producer fence polling runs on producerLoop's thread. Default
         // timer actions share XNU's serial kernel-high thread-call group with
         // the display's frame and vsync timers.
         producerTimer = IOTimerEventSource::timerEventSource(
@@ -1078,6 +1269,16 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             layerZeroFence(request));
         if (result == kIOReturnSuccess) {
             transferLayerZeroFence(request);
+            if (native_adreno_surface_profile_capture) {
+                const uint64_t compositionStartUs =
+                    dpuFrameObservation.validity & NativeFrameCompositionStartValid ?
+                    nativeFrameMicroseconds(dpuFrameObservation.compositionStart) : 0;
+                dpuFrameObservation.gpuStatus = native_adreno_surface_profile_capture(memory,
+                    producerFence, compositionStartUs, &dpuFrameObservation.gpu);
+                if (dpuFrameObservation.gpuStatus == kIOReturnSuccess) {
+                    dpuFrameObservation.validity |= NativeFrameGpuMetadataValid;
+                }
+            }
             clearProducerRequest();
             armSurfaceTimer();
             return true;

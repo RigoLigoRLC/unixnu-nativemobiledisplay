@@ -94,6 +94,7 @@ struct NativeDpuSurfaceState {
     uint64_t waitBegan = 0;
     uint64_t deadline = 0;
     uint64_t presentationLowerBound = 0;
+    uint64_t submittedTime = 0;
     NativeDpuPresentation presentation = {};
     bool presentationValid = false;
     bool disableOnRestore = false;
@@ -537,6 +538,7 @@ void submitAddress(uint32_t address, uint32_t stride) {
     write32(state.mdp, Vig0 + 0x14, address);
     __asm__ volatile("dsb sy" ::: "memory");
     state.presentationLowerBound = mach_continuous_time();
+    state.submittedTime = state.presentationLowerBound;
     write32(state.mdp, Control + 0x18, 1);
     __asm__ volatile("dsb sy" ::: "memory");
     state.pendingAddress = address;
@@ -683,7 +685,7 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
 
     if (state.operation == SurfaceOperation) {
         const NativeDpuPresentation presentation = {
-            state.presentationLowerBound, mach_continuous_time(), frame,
+            state.presentationLowerBound, mach_continuous_time(), state.submittedTime, frame,
             NativeDpuPresentationPolled
         };
         pendingTiming.wait = began - state.waitBegan;

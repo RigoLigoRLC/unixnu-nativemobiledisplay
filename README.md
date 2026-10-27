@@ -18,3 +18,39 @@ IOSurface read fence, cleared CTL flush word and advancing frame counter govern
 when the previous surface can be released.
 
 Linked into XNU by `unixnu build kernel`.
+
+`native_legacy_frame_profile_dump` copies the latest 512 completed DPU requests
+from a fixed history and prints them after releasing the history lock. The
+render and presentation paths only save values. The requested GPU diagnostic
+invokes this dump; collecting frame records adds no per-frame console output.
+
+Each `T733 frame-profile:` row carries its history sequence, the native frame
+ID, completion type, result, validity bits and continuous-clock microseconds.
+`composition_start_us` comes from the request's type-2 timestamp at `+0x2e0`:
+QuartzCore records it at the end of `begin_update`, before rendering, and its
+IOMobileFramebuffer input path converts it to the continuous clock. The swap's
+issued and requested presentation times retain their separate meanings.
+`accepted_us` records validation, `read_fence_active_us` records the first
+positive observation of the request's active IOSurface read fence, and
+`producer_ready_us` records completion of the captured global GPU safety wait.
+That global fence may include submissions for other surfaces.
+
+The Adreno profile matches the scanout descriptor to imported buffer backing
+and selects direct writes submitted since the valid native composition start.
+Each `T733 frame-write:` row names an exact submission sequence and fence for
+that frame record. Offscreen work remains in the separate GPU submission
+history. `gpu_complete_observed_us` is the CPU's first recorded observation that
+the last matching write completed. `dpu_submit_us` is sampled immediately before
+the CTL0 flush write. The actual DPU switch lies between `display_lower_us` and
+`display_upper_us`, ending at the first clear-flush and advanced-frame observation.
+These observation bounds remain visible when calculating generation and display
+latency; they retain the polling delay in the reported uncertainty.
+
+The `valid` mask uses bits 0 through 7 for composition start, issued time,
+requested time, acceptance, active read fence, completed global producer wait,
+successful GPU metadata query, and DPU bounds, respectively. A zero or future
+composition start is preserved in the row without its validity bit. GPU query
+status and `gpu_flags` describe absent, expired, incomplete or truncated source
+write metadata. The completion values are 1 for a surface, 2 for blanking, 3 for
+firmware fallback, and 4 for a dropped surface. The summary states the history
+capacity and overwrite count, so a capture can account for gaps.

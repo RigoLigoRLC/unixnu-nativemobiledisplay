@@ -15,6 +15,7 @@
 extern "C" vm_offset_t phystokv(uint64_t physical);
 extern "C" uint64_t gPhysBase;
 extern "C" uint64_t gPhysSize;
+extern "C" uint64_t mach_continuous_time(void);
 extern "C" void native_legacy_surface_increment_use(OSObject *surface);
 extern "C" void native_legacy_surface_decrement_use(OSObject *surface);
 extern "C" IOReturn native_legacy_surface_fence_complete(OSObject *fence, IOReturn status);
@@ -92,6 +93,9 @@ struct NativeDpuSurfaceState {
     uint64_t presentBegan = 0;
     uint64_t waitBegan = 0;
     uint64_t deadline = 0;
+    uint64_t presentationLowerBound = 0;
+    NativeDpuPresentation presentation = {};
+    bool presentationValid = false;
     bool disableOnRestore = false;
     bool initialized = false;
     bool failed = false;
@@ -613,6 +617,7 @@ void submitAddress(uint32_t address, uint32_t stride) {
     write32(state.mdp, Vig0 + 0x24, stride);
     write32(state.mdp, Vig0 + 0x14, address);
     __asm__ volatile("dsb sy" ::: "memory");
+    state.presentationLowerBound = mach_continuous_time();
     write32(state.mdp, Control + 0x18, 1);
     __asm__ volatile("dsb sy" ::: "memory");
     state.pendingAddress = address;
@@ -662,6 +667,9 @@ extern "C" IOReturn t733_dpu_surface_begin(OSObject *surface,
     if (state.operation != NoOperation) {
         return kIOReturnBusy;
     }
+
+    state.presentationValid = false;
+    state.presentation = {};
     if (width != 1600 || height != 2560 || stride < static_cast<uint64_t>(width) * 4 ||
         stride > SurfaceBytes / height || state.failed) {
         return state.failed ? kIOReturnNotResponding : kIOReturnBadArgument;
@@ -701,6 +709,8 @@ extern "C" IOReturn t733_dpu_surface_begin(OSObject *surface,
 }
 
 extern "C" IOReturn t733_dpu_surface_begin_restore(bool disableContext) {
+    state.presentationValid = false;
+    state.presentation = {};
     if (!state.initialized) {
         const IOReturn result = restoreBypassContext();
         if (result == kIOReturnSuccess) {
@@ -723,10 +733,12 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
     }
 
     const uint64_t began = mach_absolute_time();
+    const uint64_t observationBegan = mach_continuous_time();
     const uint32_t flush = read32(state.mdp, Control + 0x18);
     const uint32_t frame = read32(state.mdp, Interface + 0xac);
     const uint32_t fault = read32(state.smmu, Context + 0x58) & FaultMask;
     if (state.operation == SurfaceOperation && fault) {
+        state.presentationValid = false;
         IOLog("T733 DPU surface: fault=%08x far=%016llx syn=%08x addr=%x\n",
             fault, read64(state.smmu, Context + 0x60),
             read32(state.smmu, Context + 0x68), state.pendingAddress);
@@ -734,6 +746,9 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
         return kIOReturnVMError;
     }
     if (flush || frame == state.pendingFrame) {
+        if (flush) {
+            state.presentationLowerBound = observationBegan;
+        }
         pendingTiming.poll += mach_absolute_time() - began;
         if (mach_absolute_time() < state.deadline) {
             return kIOReturnNotReady;
@@ -743,10 +758,15 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
             state.pendingAddress, flush, state.pendingFrame, frame,
             read32(state.mdp, Interface + 0xb0));
         state.failed = true;
+        state.presentationValid = false;
         return kIOReturnTimeout;
     }
 
     if (state.operation == SurfaceOperation) {
+        const NativeDpuPresentation presentation = {
+            state.presentationLowerBound, mach_continuous_time(), frame,
+            NativeDpuPresentationPolled
+        };
         pendingTiming.wait = began - state.waitBegan;
         pendingTiming.frameAfter = frame;
         const int previous = state.scanning;
@@ -756,9 +776,12 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
             const IOReturn result = unmapBuffer(static_cast<unsigned>(previous));
             if (result != kIOReturnSuccess) {
                 state.failed = true;
+                state.presentationValid = false;
                 return result;
             }
         }
+        state.presentation = presentation;
+        state.presentationValid = true;
         pendingTiming.release = mach_absolute_time() - began;
         pendingTiming.total = mach_absolute_time() - state.presentBegan;
         pendingTiming.poll += mach_absolute_time() - began;
@@ -803,4 +826,20 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
     }
 
     return kIOReturnSuccess;
+}
+
+extern "C" bool t733_dpu_surface_take_presentation(NativeDpuPresentation *result) {
+    if (!result) {
+        return false;
+    }
+
+    *result = {};
+    if (!state.presentationValid) {
+        return false;
+    }
+
+    *result = state.presentation;
+    state.presentation = {};
+    state.presentationValid = false;
+    return true;
 }

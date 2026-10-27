@@ -7,6 +7,21 @@
 class IOMemoryDescriptor;
 class OSObject;
 
+enum : uint32_t {
+    NativeDpuPresentationPolled = 1
+};
+
+// NativeDpuPresentation describes the CTL flush observed for one IOSurface.
+// Both endpoints use mach_continuous_time. The upper endpoint is the first
+// observation of a completed flush and advancing frame counter, before buffer
+// reclamation. The display family pairs this value with its retained swap ID.
+struct NativeDpuPresentation {
+    uint64_t lowerBound; // A time before submission or a read of pending flush.
+    uint64_t upperBound; // The software presentation estimate, not a hardware latch.
+    uint32_t frameCount;
+    uint32_t source;
+};
+
 // The t733-dpu-scanout=1 boot argument enables the IOSurface scanout backend.
 extern "C" bool t733_dpu_surface_enabled(void);
 
@@ -24,6 +39,10 @@ extern "C" IOReturn t733_dpu_surface_begin(OSObject *surface,
 // permits the display family to complete its request. Errors retain resources
 // until a firmware restore confirms the hardware no longer scans them.
 extern "C" IOReturn t733_dpu_surface_poll(void);
+
+// The display gate consumes each successful surface presentation once. A
+// restore, failed operation or subsequent begin clears an unconsumed result.
+extern "C" bool t733_dpu_surface_take_presentation(NativeDpuPresentation *result);
 
 // Begin restore replaces any pending surface switch with the retained firmware
 // framebuffer. Poll confirms that switch before releasing surfaces or fences.

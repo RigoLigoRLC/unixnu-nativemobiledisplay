@@ -1,7 +1,7 @@
 #include "NativeLegacyRequest.h"
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// Reuse the unchanged original generic framebuffer implementation. Unknown
-// backend leaves stop; this class is not yet a published system display.
+// NativeLegacyDisplay supplies presentation for the original framebuffer
+// family's user clients and request queues. Unimplemented backend leaves stop.
 #include "OriginalLegacyFramebufferABI.h"
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
 #include "OriginalAppleARMBacklightABI.h"
@@ -10,9 +10,11 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOUserClient.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <kern/clock.h>
+#include <mach/message.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
 #include <libkern/c++/OSData.h>
@@ -71,6 +73,8 @@ extern "C" {
 // work-loop timer stands in for it while at least one client has vsync notifications enabled. Events: 0 armed, 1 sent, 2 idle (no client),
 // 3 late (missed intervals skipped), 4 started, 5 refresh properties reported at that rate.
 extern "C" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);
+extern "C" void native_legacy_frame_info_notify(void *display,
+    const OriginalLegacyFrameReport *report);
 // The unchanged original setDisplayRefreshProperties: publishes IOMFBDisplayRefresh from slot 301 (getRefreshAttributes below).
 extern "C" bool native_legacy_set_refresh_properties(void *display);
 extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
@@ -385,7 +389,141 @@ static bool nativeLegacyCopyPairs(volatile void *destination, uint64_t destinati
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+
+    static constexpr uint32_t FrameInfoPresentationMask = 1U;
+    static constexpr uint32_t FrameInfoRequestedMask = 2U;
+    static constexpr uint32_t FrameInfoSupportedMask =
+        FrameInfoPresentationMask | FrameInfoRequestedMask;
+    static constexpr unsigned FrameInfoHistoryCapacity = 64;
+
+    // FrameInfoStatistics accounts for presentation, report ownership and
+    // delivery separately. The display work-loop gate serializes every update.
+    struct FrameInfoStatistics {
+        uint64_t completed = 0;
+        uint64_t completionFailed = 0;
+        uint64_t missingPresentation = 0;
+        uint64_t unmatchedRequest = 0;
+        uint64_t generated = 0;
+        uint64_t consumed = 0;
+        uint64_t pendingDiscarded = 0;
+        uint64_t unmatchedQuery = 0;
+        uint64_t sent = 0;
+        uint64_t queueFull = 0;
+        uint64_t sendErrors = 0;
+        uint64_t subscriptions = 0;
+        uint64_t unsubscriptions = 0;
+        uint64_t maskChanges = 0;
+        uint64_t historyOverwritten = 0;
+        uint64_t uncertaintyTotal = 0;
+        uint64_t uncertaintyMaximum = 0;
+        IOReturn lastSendResult = kIOReturnSuccess;
+    };
+
+    // FrameInfoObservation retains the requested time and DPU observation
+    // interval for a completed swap after the family releases its request.
+    struct FrameInfoObservation {
+        uint64_t sequence;
+        uint64_t issuedTime;
+        uint64_t requestedTime;
+        uint64_t lowerBound;
+        uint64_t upperBound;
+        uint32_t frameID;
+        uint32_t frameCount;
+        uint32_t source;
+    };
+
+    FrameInfoStatistics frameInfoStatistics;
+    FrameInfoObservation frameInfoHistory[FrameInfoHistoryCapacity] = {};
+    unsigned frameInfoHistoryNext = 0;
+    unsigned frameInfoHistoryCount = 0;
+    uint64_t frameInfoSummaryDeadline = 0;
+    OriginalLegacyFrameReport pendingFrameInfo = {};
+    bool pendingFrameInfoValid = false;
+    bool frameInfoStopped = false;
+
+    static uint32_t frameInfoMask(const OriginalLegacyFrameInfoSubscription *subscription) {
+        uint32_t mask = 0;
+        const auto bytes = reinterpret_cast<const unsigned char *>(subscription);
+        memcpy(&mask, bytes + 0x78, sizeof(mask));
+        return mask;
+    }
+
+    static void storeFrameInfoMask(OriginalLegacyFrameInfoSubscription *subscription,
+        uint32_t mask) {
+        auto bytes = reinterpret_cast<unsigned char *>(subscription);
+        memcpy(bytes + 0x78, &mask, sizeof(mask));
+    }
+
+    void discardFrameInfoReport() {
+        if (pendingFrameInfoValid) {
+            ++frameInfoStatistics.pendingDiscarded;
+        }
+        pendingFrameInfoValid = false;
+        pendingFrameInfo = {};
+    }
+
+    void stopFrameInfo() {
+        auto action = [](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
+            NativeLegacyDisplay *display = static_cast<NativeLegacyDisplay *>(owner);
+            display->frameInfoStopped = true;
+            display->discardFrameInfoReport();
+            return kIOReturnSuccess;
+        };
+        if (IOWorkLoop *loop = getWorkLoop()) {
+            loop->runAction(action, this);
+        } else {
+            action(this, nullptr, nullptr, nullptr, nullptr);
+        }
+    }
+
+    void summarizeFrameInfo() {
+        if (mach_absolute_time() < frameInfoSummaryDeadline) {
+            return;
+        }
+
+        clock_interval_to_deadline(5000, kMillisecondScale, &frameInfoSummaryDeadline);
+        uint64_t maximumNanoseconds = 0;
+        absolutetime_to_nanoseconds(frameInfoStatistics.uncertaintyMaximum, &maximumNanoseconds);
+        IOLog("T733 FrameInfo: complete=%llu failed=%llu missing=%llu unmatched=%llu reports=%llu consumed=%llu discarded=%llu query-miss=%llu sent=%llu full=%llu errors=%llu status=%x subscriptions=%llu/%llu masks=%llu history-overwritten=%llu uncertainty-max-us=%llu\n",
+            frameInfoStatistics.completed, frameInfoStatistics.completionFailed,
+            frameInfoStatistics.missingPresentation, frameInfoStatistics.unmatchedRequest,
+            frameInfoStatistics.generated, frameInfoStatistics.consumed,
+            frameInfoStatistics.pendingDiscarded, frameInfoStatistics.unmatchedQuery,
+            frameInfoStatistics.sent, frameInfoStatistics.queueFull,
+            frameInfoStatistics.sendErrors, frameInfoStatistics.lastSendResult,
+            frameInfoStatistics.subscriptions, frameInfoStatistics.unsubscriptions,
+            frameInfoStatistics.maskChanges, frameInfoStatistics.historyOverwritten,
+            maximumNanoseconds / 1000);
+    }
+
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+    void stageFrameInfoReport(const OriginalLegacySwapRequest *request,
+        const NativeDpuPresentation &presentation) {
+        discardFrameInfoReport();
+        pendingFrameInfo.setPresentation(request, presentation.upperBound);
+        pendingFrameInfoValid = true;
+        ++frameInfoStatistics.generated;
+        const uint64_t uncertainty = presentation.upperBound - presentation.lowerBound;
+        frameInfoStatistics.uncertaintyTotal += uncertainty;
+        if (uncertainty > frameInfoStatistics.uncertaintyMaximum) {
+            frameInfoStatistics.uncertaintyMaximum = uncertainty;
+        }
+
+        FrameInfoObservation &observation = frameInfoHistory[frameInfoHistoryNext];
+        observation = {
+            frameInfoStatistics.generated, pendingFrameInfo.issuedTime(),
+            pendingFrameInfo.requestedPresentation(), presentation.lowerBound,
+            presentation.upperBound, pendingFrameInfo.frameID(), presentation.frameCount,
+            presentation.source
+        };
+        frameInfoHistoryNext = (frameInfoHistoryNext + 1) % FrameInfoHistoryCapacity;
+        if (frameInfoHistoryCount < FrameInfoHistoryCapacity) {
+            ++frameInfoHistoryCount;
+        } else {
+            ++frameInfoStatistics.historyOverwritten;
+        }
+    }
+
     NativeT733Backlight *backlight = nullptr;
 
     bool startBacklight() {
@@ -715,7 +853,20 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         dpuRestoring = false;
         dpuBlocked = false;
 
+        NativeDpuPresentation presentation = {};
+        const bool hasPresentation = t733_dpu_surface_take_presentation(&presentation);
         const bool queued = request && pendingSwapRequest() == request && isValidated(request);
+        if (completion == SurfaceCompletion && result == kIOReturnSuccess) {
+            ++frameInfoStatistics.completed;
+            if (!hasPresentation) {
+                ++frameInfoStatistics.missingPresentation;
+            } else if (!queued) {
+                ++frameInfoStatistics.unmatchedRequest;
+            } else if (!frameInfoStopped) {
+                stageFrameInfoReport(request, presentation);
+            }
+        }
+
         if (queued && completion != FallbackCompletion) {
             native_legacy_transfer_observed(result, request,
                 completion == DroppedCompletion ? 0 : length);
@@ -723,6 +874,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         } else if (request && !queued) {
             removeValidated(request);
         }
+        discardFrameInfoReport();
         transferred = false;
         if (request) {
             requestObject(request)->release();
@@ -730,6 +882,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if (completion == FallbackCompletion || completion == DroppedCompletion) {
             gpuBypass = true;
         }
+        summarizeFrameInfo();
         kickSwapQueueGated();
     }
 
@@ -768,6 +921,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
                     return;
                 }
 
+                ++frameInfoStatistics.completionFailed;
+                summarizeFrameInfo();
                 dpuFallback = true;
                 dpuCompletion = DroppedCompletion;
                 dpuResult = result;
@@ -814,6 +969,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         producerTimerAdded = true;
 
         displayStopping = false;
+        frameInfoStopped = false;
         return true;
     }
 
@@ -827,6 +983,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         auto begin = [](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
             NativeLegacyDisplay *display = static_cast<NativeLegacyDisplay *>(owner);
             display->displayStopping = true;
+            display->frameInfoStopped = true;
+            display->discardFrameInfoReport();
             display->transferred = true;
             if (display->surfaceTimer) {
                 display->surfaceTimer->disable();
@@ -913,8 +1071,11 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
 
         IOLog("T733 DPU surface: present failed status=%x fence=%u request=%p\n",
             result, producerFence, request);
+        ++frameInfoStatistics.completionFailed;
+        summarizeFrameInfo();
         dpuFallback = true;
         dpuCompletion = FallbackCompletion;
+        dpuResult = result;
         beginDpuRestore(true);
         return true;
     }
@@ -1002,6 +1163,7 @@ public:
         if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
     }
     void free() override {
+        stopFrameInfo();
         stopVsync();
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
         stopDpuSurface();
@@ -1023,6 +1185,7 @@ public:
         IOMobileFramebufferLegacy::free();
     }
     void stop(IOService *provider) override {
+        stopFrameInfo();
         stopVsync();
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
         stopDpuSurface();
@@ -1451,11 +1614,53 @@ public:
         transferred = false;
         kickSwapQueue();
     }
-    IOReturn collectCompletionReports(uint32_t,void *,uint32_t *count,uint32_t) override {
-        // The original completion helper passes null optional outputs and
-        // ignores this IOReturn. GOP exposes no hardware completion telemetry.
-        if(count)*count=0;
-        return kIOReturnUnsupported;
+    IOReturn collectCompletionReports(uint32_t frameID, OriginalLegacyFrameReport *reports,
+        uint32_t *count, uint32_t capacity) override {
+        if (count) {
+            *count = 0;
+        }
+        if (reports && (!count || !capacity)) {
+            return kIOReturnBadArgument;
+        }
+
+        IOWorkLoop *loop = getWorkLoop();
+        if (!loop) {
+            return kIOReturnNotReady;
+        }
+        if (!loop->inGate()) {
+            struct Arguments {
+                uint32_t frameID;
+                OriginalLegacyFrameReport *reports;
+                uint32_t *count;
+                uint32_t capacity;
+            } arguments = {frameID, reports, count, capacity};
+            return loop->runAction([](OSObject *owner, void *argument, void *, void *, void *) -> IOReturn {
+                auto args = static_cast<Arguments *>(argument);
+                return static_cast<NativeLegacyDisplay *>(owner)->collectCompletionReports(
+                    args->frameID, args->reports, args->count, args->capacity);
+            }, this, &arguments);
+        }
+
+        if (!pendingFrameInfoValid) {
+            return kIOReturnSuccess;
+        }
+        if (pendingFrameInfo.frameID() != frameID) {
+            ++frameInfoStatistics.unmatchedQuery;
+            return kIOReturnSuccess;
+        }
+
+        const OriginalLegacyFrameReport report = pendingFrameInfo;
+        pendingFrameInfoValid = false;
+        pendingFrameInfo = {};
+        ++frameInfoStatistics.consumed;
+
+        if (reports) {
+            reports[0] = report;
+            *count = 1;
+        } else {
+            native_legacy_frame_info_notify(this, &report);
+        }
+        return kIOReturnSuccess;
     }
     bool validateSwap(const OriginalLegacySwapRequest *request) override {
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
@@ -1542,11 +1747,102 @@ public:
         if(!data || data->getLength()!=sizeof(*pitch))return kIOReturnBadArgument;
         memcpy(pitch,data->getBytesNoCopy(),sizeof(*pitch));return kIOReturnSuccess;
     }
-    // Selector 74 enumerates optional frame-info trace keys, not display
-    // modes. This backend implements no trace-key subscription contract.
-    IOReturn supportedFrameInfo(uint32_t,uint32_t *count,char *key,uint32_t *mask) override {
-        if(!count || !key || !mask)return kIOReturnBadArgument;
-        *count=0;*mask=0;bzero(key,64);return kIOReturnUnsupported;
+    // Selector 74 returns key names and the client transport selection. Zero
+    // selects the Mach notification path whose async reference slot 336 enables.
+    IOReturn supportedFrameInfo(uint32_t index, uint32_t *count, char *key,
+        uint32_t *transport) override {
+        if (!count || !key || !transport) {
+            return kIOReturnBadArgument;
+        }
+
+        *count = 0;
+        *transport = 0;
+        bzero(key, 64);
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (primary && t733_dpu_surface_enabled()) {
+            static const char *const keys[] = {
+                "Presentation_time", "Requested_presentation"
+            };
+            *count = 2;
+            if (index >= *count) {
+                return kIOReturnBadArgument;
+            }
+
+            strlcpy(key, keys[index], 64);
+            return kIOReturnSuccess;
+        }
+#endif
+        return kIOReturnUnsupported;
+    }
+
+    bool usesSharedFrameInfoQueue() override {
+        return false;
+    }
+
+    IOReturn setFrameInfoNotificationMask(uint32_t type,
+        OriginalLegacyFrameInfoSubscription *subscription, uint32_t mask) override {
+        if (type != 3) {
+            return kIOReturnUnsupported;
+        }
+        if (!subscription || (mask & ~FrameInfoSupportedMask)) {
+            return kIOReturnBadArgument;
+        }
+
+        storeFrameInfoMask(subscription, mask);
+        ++frameInfoStatistics.maskChanges;
+        return kIOReturnSuccess;
+    }
+
+    void frameInfoSubscriptionChanged(OriginalLegacyFrameInfoSubscription *subscription,
+        bool enabled) override {
+        if (!subscription) {
+            return;
+        }
+
+        storeFrameInfoMask(subscription, 0);
+        if (enabled) {
+            ++frameInfoStatistics.subscriptions;
+        } else {
+            ++frameInfoStatistics.unsubscriptions;
+        }
+    }
+
+    // The original sender holds the display gate and owns this subscription.
+    // A full notification port drops only telemetry; request retirement proceeds.
+    IOReturn sendFrameInfo(OriginalLegacyFrameInfoSubscription *subscription,
+        const OriginalLegacyFrameReport *report) override {
+        if (!subscription || !report) {
+            return kIOReturnBadArgument;
+        }
+
+        const uint32_t mask = frameInfoMask(subscription) & FrameInfoSupportedMask;
+        if (!mask || frameInfoStopped) {
+            return kIOReturnSuccess;
+        }
+
+        io_user_reference_t arguments[4] = {mask, report->frameID(), 0, 0};
+        UInt32 count = 2;
+        if (mask & FrameInfoPresentationMask) {
+            arguments[count++] = report->presentationTime();
+        }
+        if (mask & FrameInfoRequestedMask) {
+            arguments[count++] = report->requestedPresentation();
+        }
+
+        auto bytes = reinterpret_cast<unsigned char *>(subscription);
+        auto reference = reinterpret_cast<io_user_reference_t *>(bytes + 0x18);
+        const IOReturn result = IOUserClient::sendAsyncResult64WithOptions(reference,
+            kIOReturnSuccess, arguments, count, kIOUserNotifyOptionCanDrop);
+        frameInfoStatistics.lastSendResult = result;
+        if (result == kIOReturnSuccess) {
+            ++frameInfoStatistics.sent;
+        } else if (result == MACH_SEND_TIMED_OUT) {
+            ++frameInfoStatistics.queueFull;
+        } else {
+            ++frameInfoStatistics.sendErrors;
+        }
+
+        return kIOReturnSuccess;
     }
     IOReturn newUserClient(task_t task,void *security,UInt32 type,IOUserClient **client) override {
         native_legacy_client_enter(task,type);
@@ -1596,11 +1892,8 @@ public:
         OSSafeReleaseNULL(mapping);return valid;
     }
 #define LEAF(n) __attribute__((noreturn,noinline)) void opaque##n() override { native_legacy_backend_guard(n,this,__builtin_return_address(0)); }
-    LEAF(211)
     LEAF(245)
     LEAF(246)
-    LEAF(306)
-    LEAF(307)
     LEAF(338)
 #undef LEAF
 };

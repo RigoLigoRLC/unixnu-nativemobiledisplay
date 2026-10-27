@@ -5,16 +5,16 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOLib.h>
-#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <kern/clock.h>
-#include <kern/cpu_data.h>
 #include <kern/task.h>
+#include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
+#include <vm/memory_types.h>
 
-extern "C" vm_offset_t phystokv(uint64_t physical);
 extern "C" uint64_t gPhysBase;
 extern "C" uint64_t gPhysSize;
+extern "C" unsigned int pmap_cache_attributes(ppnum_t page);
 extern "C" uint64_t mach_continuous_time(void);
 extern "C" void native_legacy_surface_increment_use(OSObject *surface);
 extern "C" void native_legacy_surface_decrement_use(OSObject *surface);
@@ -44,7 +44,8 @@ constexpr uint32_t Context = 0x84000;
 constexpr uint32_t GlobalPage = 0x1000;
 constexpr uint32_t FaultMask = 0xc00001fe;
 constexpr uint32_t ContextControl = 0x00c01127;
-constexpr uint32_t TranslationControl = 0x80802020;
+// The SM7325 apps SMMU reads CPU-written tables with outer-shareable WBWA walks.
+constexpr uint32_t TranslationControl = 0x80802520;
 constexpr uint32_t TranslationControl2 = 0x00038011;
 constexpr unsigned FlipMilliseconds = 80;
 enum : unsigned { NoOperation, SurfaceOperation, FirmwareOperation };
@@ -55,7 +56,6 @@ struct NativeDpuSurfaceBuffer {
     OSObject *surface = nullptr;
     OSObject *fence = nullptr; // An active read fence holds queued writers until this surface is replaced.
     IOMemoryDescriptor *memory = nullptr;
-    uint64_t bytes = 0;
     uint32_t stride = 0;
     bool prepared = false;
     bool inUse = false; // The global IOSurface use count prevents compositor reuse during scanout.
@@ -67,11 +67,11 @@ struct NativeDpuSurfaceBuffer {
 // The stream-match pair, display clocks, DSI timing, mixer and backlight remain
 // owned by their existing components.
 //
-// A present wires the next IOSurface's pages, publishes read-only Normal NC
-// leaves, and switches the inherited VIG0 address through CTL0. INTF1's frame
-// counter and the cleared CTL flush word determine when the old buffer can be
-// unmapped. The table allocation uses its normal kernel mapping and explicit
-// cache cleaning; no CPU cache attribute of an IOSurface is changed.
+// A present wires the next IOSurface's pages and reads their CPU attributes.
+// Cached pages use coherent read-only WB leaves; Normal NC pages use NC leaves.
+// A store barrier publishes the WB page tables to the coherent SMMU walker
+// before CTL0 switches VIG0's address. INTF1's advancing frame counter and the
+// cleared CTL flush word determine when the old buffer can be unmapped.
 struct NativeDpuSurfaceState {
     IOMemoryMap *mdp = nullptr;
     IOMemoryMap *smmu = nullptr;
@@ -101,6 +101,7 @@ struct NativeDpuSurfaceState {
     bool failed = false;
     bool tablesPrepared = false;
     bool contextEnabled = false;
+    bool managedRtNormal = false; // The selected XNU boot policy maps managed RT pages as Normal NC.
 };
 
 NativeDpuSurfaceState state;
@@ -111,7 +112,6 @@ struct NativeDpuSurfaceTiming {
     uint64_t initialize = 0;
     uint64_t prepare = 0;
     uint64_t pages = 0;
-    uint64_t clean = 0;
     uint64_t tables = 0;
     uint64_t wait = 0;
     uint64_t release = 0;
@@ -180,102 +180,6 @@ void write64(IOMemoryMap *mapping, uint32_t offset, uint64_t value) {
     *reinterpret_cast<volatile uint64_t *>(mapping->getVirtualAddress() + offset) = value;
 }
 
-// The caller supplies a resident, writable Normal kernel mapping. Page-table
-// allocations are touched before this call; IOSurface pages use phystokv.
-IOReturn cleanNormalMemory(void *mapping, uint64_t bytes) {
-    if (!mapping || !bytes || bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(mapping)) {
-        return kIOReturnBadArgument;
-    }
-
-    uintptr_t address = reinterpret_cast<uintptr_t>(mapping);
-    const uintptr_t end = address + bytes;
-    while (address < end) {
-        disable_preemption();
-        uint64_t ctr = 0;
-        __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
-        const uintptr_t line = static_cast<uintptr_t>(4) << ((ctr >> 16) & 15);
-        if (line > PageBytes) {
-            enable_preemption();
-            return kIOReturnUnsupported;
-        }
-
-        uintptr_t limit = address + 64 * PageBytes;
-        if (limit > end) {
-            limit = end;
-        }
-        address &= ~(line - 1);
-        __asm__ volatile("dsb sy" ::: "memory");
-        while (address < limit) {
-            __asm__ volatile("dc cvac, %0" :: "r"(address) : "memory");
-            address += line;
-        }
-        __asm__ volatile("dsb sy" ::: "memory");
-        enable_preemption();
-    }
-
-    return kIOReturnSuccess;
-}
-
-IOReturn cleanSurfacePages(IOMemoryDescriptor *memory, uint64_t bytes) {
-    uint64_t offset = 0;
-    uint64_t physical = 0;
-    uint64_t segmentBytes = 0;
-    while (offset < bytes) {
-        uint64_t pages[64];
-        unsigned count = 0;
-        while (count < 64 && offset < bytes) {
-            if (!segmentBytes) {
-                IOByteCount length = 0;
-                physical = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
-                segmentBytes = length;
-                if (segmentBytes > bytes - offset) {
-                    segmentBytes = bytes - offset;
-                }
-                segmentBytes &= ~(PageBytes - 1);
-                if (!segmentBytes || (physical & (PageBytes - 1)) || physical < gPhysBase ||
-                    physical - gPhysBase >= gPhysSize ||
-                    segmentBytes > gPhysSize - (physical - gPhysBase)) {
-                    return kIOReturnUnsupported;
-                }
-            }
-
-            pages[count++] = physical;
-            physical += PageBytes;
-            segmentBytes -= PageBytes;
-            offset += PageBytes;
-        }
-
-        disable_preemption();
-        uint64_t ctr = 0;
-        __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
-        const uintptr_t line = static_cast<uintptr_t>(4) << ((ctr >> 16) & 15);
-        if (line > PageBytes) {
-            enable_preemption();
-            return kIOReturnUnsupported;
-        }
-
-        // The prepared descriptor owns these RAM pages. The permanent kernel
-        // aliases retain writable Normal PTEs across scattered physical spans.
-        __asm__ volatile("dsb sy" ::: "memory");
-        for (unsigned page = 0; page < count; ++page) {
-            const vm_offset_t alias = phystokv(pages[page]);
-            if (!alias) {
-                __asm__ volatile("dsb sy" ::: "memory");
-                enable_preemption();
-                return kIOReturnUnsupported;
-            }
-
-            for (uintptr_t address = alias, end = alias + PageBytes; address < end; address += line) {
-                __asm__ volatile("dc cvac, %0" :: "r"(address) : "memory");
-            }
-        }
-        __asm__ volatile("dsb sy" ::: "memory");
-        enable_preemption();
-    }
-
-    return kIOReturnSuccess;
-}
-
 uint64_t *tablePage(unsigned index) {
     return state.tables + index * (PageBytes / sizeof(uint64_t));
 }
@@ -284,9 +188,26 @@ uint64_t tableDescriptor(unsigned index) {
     return state.tablePhysical + index * PageBytes + 3;
 }
 
-uint64_t pageDescriptor(uint64_t physical) {
-    // AF, outer shareability, read-only access, PXN and UXN; MAIR index 0 is NC.
-    return physical | UINT64_C(0x00600000000006c3);
+uint64_t pageDescriptor(uint64_t physical, bool cached) {
+    // AF, outer shareability, read-only access, PXN and UXN; MAIR 0 is NC and 1 is WB.
+    return physical | UINT64_C(0x00600000000006c3) | (cached ? 4 : 0);
+}
+
+uint64_t surfacePageDescriptor(uint64_t physical) {
+    const unsigned attributes = pmap_cache_attributes(
+        static_cast<ppnum_t>(physical / PageBytes)) & VM_WIMG_MASK;
+    switch (attributes) {
+        case VM_WIMG_COPYBACK:
+        case VM_WIMG_INNERWBACK:
+        case VM_WIMG_WTHRU:
+            return pageDescriptor(physical, true);
+        case VM_WIMG_WCOMB:
+            return pageDescriptor(physical, false);
+        case VM_WIMG_RT:
+            return state.managedRtNormal ? pageDescriptor(physical, false) : 0;
+        default:
+            return 0;
+    }
 }
 
 uint64_t *surfaceLeaves(unsigned slot) {
@@ -396,7 +317,8 @@ IOReturn allocateTables() {
     state.tableBytes = tablePages * PageBytes;
     state.tableMemory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
         static_cast<IOOptionBits>(kIODirectionInOut) |
-        static_cast<IOOptionBits>(kIOMemoryMapperNone) | kIOMemoryPhysicallyContiguous,
+        static_cast<IOOptionBits>(kIOMemoryMapperNone) | kIOMemoryPhysicallyContiguous |
+        kIOMapCopybackCache,
         state.tableBytes, (PhysicalLimit - 1) & ~(PageBytes - 1));
     if (!state.tableMemory) {
         return kIOReturnNoMemory;
@@ -436,10 +358,12 @@ IOReturn allocateTables() {
 
     uint64_t *firmwareLeaves = tablePage(firmwareTable);
     for (uint64_t offset = 0; offset < state.firmwareBytes; offset += PageBytes) {
-        firmwareLeaves[offset / PageBytes] = pageDescriptor(state.firmwareAddress + offset);
+        firmwareLeaves[offset / PageBytes] = pageDescriptor(state.firmwareAddress + offset, false);
     }
 
-    return cleanNormalMemory(state.tables, state.tableBytes);
+    __asm__ volatile("dsb oshst" ::: "memory");
+
+    return kIOReturnSuccess;
 }
 
 IOReturn initialize() {
@@ -466,6 +390,9 @@ IOReturn initialize() {
     state.firmwareStride = captured->firmwareStride;
     state.firmwareBytes = captured->firmwareBytes;
     state.savedContext = captured->contexts[0];
+    unsigned managedRtNormal = 0;
+    PE_parse_boot_argn("t733-managed-rt-normal", &managedRtNormal, sizeof(managedRtNormal));
+    state.managedRtNormal = managedRtNormal == 1;
     state.mdp = mapRegisters(MdpPhysical, MdpBytes);
     state.smmu = mapRegisters(SmmuPhysical, SmmuBytes);
     if (!state.mdp || !state.smmu) {
@@ -547,7 +474,6 @@ IOReturn mapBuffer(unsigned slot, OSObject *surface, IOMemoryDescriptor *memory,
     memory->retain();
     buffer.surface = surface;
     buffer.memory = memory;
-    buffer.bytes = mappedBytes;
     buffer.stride = static_cast<uint32_t>(stride);
 
     IOReturn result = memory->prepare(kIODirectionOut);
@@ -565,31 +491,27 @@ IOReturn mapBuffer(unsigned slot, OSObject *surface, IOMemoryDescriptor *memory,
     for (uint64_t offset = 0; offset < mappedBytes; offset += PageBytes) {
         IOByteCount length = 0;
         const uint64_t physical = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
-        if (!physical || !length || (physical & (PageBytes - 1)) || physical >= PhysicalLimit ||
-            leaves[offset / PageBytes]) {
+        if (!physical || length < PageBytes || (physical & (PageBytes - 1)) ||
+            physical >= PhysicalLimit || physical < gPhysBase ||
+            physical - gPhysBase >= gPhysSize ||
+            PageBytes > gPhysSize - (physical - gPhysBase) || leaves[offset / PageBytes]) {
             bzero(leaves, SurfaceTablePages * PageBytes);
             releaseBuffer(buffer);
             return kIOReturnUnsupported;
         }
-        leaves[offset / PageBytes] = pageDescriptor(physical);
+        const uint64_t descriptor = surfacePageDescriptor(physical);
+        if (!descriptor) {
+            bzero(leaves, SurfaceTablePages * PageBytes);
+            releaseBuffer(buffer);
+            return kIOReturnUnsupported;
+        }
+        leaves[offset / PageBytes] = descriptor;
     }
     const uint64_t pages = mach_absolute_time();
     timing.pages = pages - prepared;
 
-    result = cleanSurfacePages(memory, mappedBytes);
-    if (result != kIOReturnSuccess) {
-        bzero(leaves, SurfaceTablePages * PageBytes);
-        releaseBuffer(buffer);
-        return result;
-    }
-    const uint64_t cleaned = mach_absolute_time();
-    timing.clean = cleaned - pages;
-
-    result = cleanNormalMemory(leaves, SurfaceTablePages * PageBytes);
-    if (result == kIOReturnSuccess) {
-        result = synchronizeContext();
-    }
-    timing.tables = mach_absolute_time() - cleaned;
+    result = synchronizeContext();
+    timing.tables = mach_absolute_time() - pages;
 
     return result;
 }
@@ -602,10 +524,7 @@ IOReturn unmapBuffer(unsigned slot) {
 
     uint64_t *leaves = surfaceLeaves(slot);
     bzero(leaves, SurfaceTablePages * PageBytes);
-    IOReturn result = cleanNormalMemory(leaves, SurfaceTablePages * PageBytes);
-    if (result == kIOReturnSuccess) {
-        result = synchronizeContext();
-    }
+    const IOReturn result = synchronizeContext();
     if (result != kIOReturnSuccess) {
         return result;
     }
@@ -790,10 +709,10 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
         if (logPresentTiming(state.sequence)) {
             IOLog("T733 DPU surface: flip=%llu iova=%x stride=%u frame=%u previous=%d asynchronous=1\n",
                 state.sequence, state.pendingAddress, state.buffers[state.scanning].stride, frame, previous);
-            IOLog("T733 DPU surface: us total=%llu submit=%llu poll=%llu init=%llu prepare=%llu pages=%llu clean=%llu tables=%llu wait=%llu release=%llu frames=%u,%u\n",
+            IOLog("T733 DPU surface: us total=%llu submit=%llu poll=%llu init=%llu prepare=%llu pages=%llu tables=%llu wait=%llu release=%llu frames=%u,%u\n",
                 microseconds(pendingTiming.total), microseconds(pendingTiming.submit), microseconds(pendingTiming.poll),
                 microseconds(pendingTiming.initialize), microseconds(pendingTiming.prepare), microseconds(pendingTiming.pages),
-                microseconds(pendingTiming.clean), microseconds(pendingTiming.tables), microseconds(pendingTiming.wait),
+                microseconds(pendingTiming.tables), microseconds(pendingTiming.wait),
                 microseconds(pendingTiming.release), pendingTiming.frameBefore, pendingTiming.frameAfter);
         }
 

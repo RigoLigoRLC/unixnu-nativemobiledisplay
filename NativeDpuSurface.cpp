@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #include "NativeDpuSurface.h"
 #include "NativeDpuScanout.h"
+#include "NativeDpuInterrupt.h"
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODeviceMemory.h>
@@ -19,6 +20,8 @@ extern "C" uint64_t mach_continuous_time(void);
 extern "C" void native_legacy_surface_increment_use(OSObject *surface);
 extern "C" void native_legacy_surface_decrement_use(OSObject *surface);
 extern "C" IOReturn native_legacy_surface_fence_complete(OSObject *fence, IOReturn status);
+extern "C" void native_adreno_surface_release_read(NativeAdrenoSurfaceRead *)
+    __attribute__((weak_import));
 
 namespace {
 
@@ -55,6 +58,7 @@ enum : unsigned { NoOperation, SurfaceOperation, FirmwareOperation };
 struct NativeDpuSurfaceBuffer {
     OSObject *surface = nullptr;
     OSObject *fence = nullptr; // An active read fence holds queued writers until this surface is replaced.
+    NativeAdrenoSurfaceRead *gpuRead = nullptr; // GPU writers wait until DPU scanout releases this reservation.
     IOMemoryDescriptor *memory = nullptr;
     uint32_t stride = 0;
     bool prepared = false;
@@ -239,6 +243,10 @@ IOReturn releaseBuffer(NativeDpuSurfaceBuffer &buffer) {
             return result;
         }
         buffer.prepared = false;
+    }
+    if (buffer.gpuRead) {
+        native_adreno_surface_release_read(buffer.gpuRead);
+        buffer.gpuRead = nullptr;
     }
     if (buffer.fence) {
         const IOReturn result = native_legacy_surface_fence_complete(buffer.fence, kIOReturnSuccess);
@@ -581,7 +589,7 @@ extern "C" bool t733_dpu_surface_timing_enabled(void) {
 
 extern "C" IOReturn t733_dpu_surface_begin(OSObject *surface,
     IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height,
-    OSObject *fence) {
+    OSObject *fence, NativeAdrenoSurfaceRead *gpuRead) {
     if (!t733_dpu_surface_enabled()) {
         return kIOReturnUnsupported;
     }
@@ -615,6 +623,7 @@ extern "C" IOReturn t733_dpu_surface_begin(OSObject *surface,
 
     NativeDpuSurfaceBuffer &buffer = state.buffers[next];
     buffer.fence = fence;
+    buffer.gpuRead = gpuRead;
     if (fence && buffer.inUse) {
         native_legacy_surface_decrement_use(buffer.surface);
         buffer.inUse = false;
@@ -648,15 +657,18 @@ extern "C" IOReturn t733_dpu_surface_begin_restore(bool disableContext) {
     return kIOReturnSuccess;
 }
 
-extern "C" IOReturn t733_dpu_surface_poll(void) {
+static IOReturn observeSurface(const NativeDpuVblankSample *sample) {
     if (state.operation == NoOperation) {
         return kIOReturnSuccess;
     }
+    if (sample && sample->observationBegan < state.submittedTime) {
+        return kIOReturnNotReady;
+    }
 
     const uint64_t began = mach_absolute_time();
-    const uint64_t observationBegan = mach_continuous_time();
-    const uint32_t flush = read32(state.mdp, Control + 0x18);
-    const uint32_t frame = read32(state.mdp, Interface + 0xac);
+    const uint64_t observationBegan = sample ? sample->observationBegan : mach_continuous_time();
+    const uint32_t flush = sample ? sample->flush : read32(state.mdp, Control + 0x18);
+    const uint32_t frame = sample ? sample->frameCount : read32(state.mdp, Interface + 0xac);
     const uint32_t fault = read32(state.smmu, Context + 0x58) & FaultMask;
     if (state.operation == SurfaceOperation && fault) {
         state.presentationValid = false;
@@ -685,8 +697,8 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
 
     if (state.operation == SurfaceOperation) {
         const NativeDpuPresentation presentation = {
-            state.presentationLowerBound, mach_continuous_time(), state.submittedTime, frame,
-            NativeDpuPresentationPolled
+            state.presentationLowerBound, sample ? sample->continuousTime : mach_continuous_time(),
+            state.submittedTime, frame, sample ? NativeDpuPresentationVblank : NativeDpuPresentationPolled
         };
         pendingTiming.wait = began - state.waitBegan;
         pendingTiming.frameAfter = frame;
@@ -747,6 +759,18 @@ extern "C" IOReturn t733_dpu_surface_poll(void) {
     }
 
     return kIOReturnSuccess;
+}
+
+extern "C" IOReturn t733_dpu_surface_poll(void) {
+    return observeSurface(nullptr);
+}
+
+extern "C" IOReturn t733_dpu_surface_vblank(const NativeDpuVblankSample *sample) {
+    if (!sample) {
+        return kIOReturnBadArgument;
+    }
+
+    return observeSurface(sample);
 }
 
 extern "C" bool t733_dpu_surface_take_presentation(NativeDpuPresentation *result) {

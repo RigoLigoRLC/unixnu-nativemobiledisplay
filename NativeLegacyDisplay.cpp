@@ -6,6 +6,7 @@
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
 #include "OriginalAppleARMBacklightABI.h"
 #include "NativeDpuSurface.h"
+#include "NativeDpuInterrupt.h"
 #include "../Adreno6xx/NativeAdrenoDisplay.h"
 #endif
 #include <IOKit/IOLib.h>
@@ -13,6 +14,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOWorkLoop.h>
+#include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <kern/clock.h>
 #include <mach/message.h>
@@ -54,9 +56,12 @@ extern "C" void t733_display_submission_observed(uint64_t start, uint64_t mapTic
     bool reused, uint64_t hits, uint64_t mappings, bool paired,
     uint64_t cpuStart, uint64_t cpuEnd, int boundCpu, uint64_t bindTicks);
 extern "C" void t733_display_mapping_observed(uint64_t scanout, uint64_t surface);
-extern "C" IOReturn native_adreno_capture_surface_producer(uint32_t *capturedFence)
+extern "C" IOReturn native_adreno_surface_acquire_read(IOMemoryDescriptor *,
+    void (*)(void *, IOReturn), void *, NativeAdrenoSurfaceRead **)
     __attribute__((weak_import));
-extern "C" IOReturn native_adreno_poll_surface_producer(uint32_t capturedFence)
+extern "C" IOReturn native_adreno_surface_read_status(NativeAdrenoSurfaceRead *, uint32_t *)
+    __attribute__((weak_import));
+extern "C" void native_adreno_surface_release_read(NativeAdrenoSurfaceRead *)
     __attribute__((weak_import));
 extern "C" IOReturn native_adreno_surface_profile_capture(IOMemoryDescriptor *memory,
     uint32_t capturedFence, uint64_t compositionStartContinuousUs,
@@ -113,7 +118,7 @@ struct NativeLegacyFrameObservation {
     uint32_t frameID = 0;
     uint32_t completion = 0;
     uint32_t validity = 0;
-    uint32_t capturedFence = 0; // The global safety wait may include other surfaces.
+    uint32_t capturedFence = 0; // The latest hardware fence among this surface's writers.
     bool queued = false;
     IOReturn status = kIOReturnSuccess;
     IOReturn gpuStatus = kIOReturnUnsupported;
@@ -851,23 +856,24 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool dpuBlocked = false;
     bool displayStopping = false;
     IOTimerEventSource *surfaceTimer = nullptr;
-    IOWorkLoop *producerLoop = nullptr;
-    IOTimerEventSource *producerTimer = nullptr;
+    IOInterruptEventSource *completionEvent = nullptr;
+    IOInterruptEventSource *vblankEvent = nullptr;
     IOLock *producerLock = nullptr;
     bool surfaceTimerAdded = false;
-    bool producerTimerAdded = false;
+    bool completionEventAdded = false;
+    bool vblankEventAdded = false;
+    bool vblankInterrupt = false;
 
-    // The producer work loop owns capture and GPU completion polling. The display
-    // gate owns producerRequest and consumes the result under producerLock.
-    // A generation change discards an in-flight result after request cancel.
-    uint64_t producerGeneration = 0;
+    // The GPU completion callback only records the result and wakes the display
+    // work loop. The display gate owns the request and transfers its read
+    // reservation to the DPU buffer when scanout begins.
+    NativeAdrenoSurfaceRead *producerRead = nullptr;
     uint32_t producerFence = 0;
     uint64_t producerReadFenceActiveTime = 0;
     uint64_t producerWaitTime = 0;
     uint64_t producerReadyTime = 0;
+    uint64_t producerDeadline = 0;
     IOReturn producerResult = kIOReturnNotReady;
-    bool producerPending = false;
-    bool producerCaptured = false;
     bool producerDone = false;
     const OriginalLegacySwapRequest *producerRequest = nullptr;
 
@@ -891,17 +897,22 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
 
     void armSurfaceTimer(unsigned milliseconds = 1) {
         if (surfaceTimer && !displayStopping) {
+            if (vblankInterrupt && milliseconds < 100) {
+                milliseconds = 100;
+            }
             surfaceTimer->setTimeoutMS(milliseconds);
         }
     }
 
     void clearProducerRequest() {
+        NativeAdrenoSurfaceRead *read = producerRead;
+        producerRead = nullptr;
+        if (read) {
+            native_adreno_surface_release_read(read);
+        }
         if (producerLock) {
             IOLockLock(producerLock);
-            ++producerGeneration;
-            producerPending = false;
             producerDone = false;
-            producerCaptured = false;
             producerReadyTime = 0;
             IOLockUnlock(producerLock);
         }
@@ -913,54 +924,44 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         }
     }
 
-    static void producerFired(OSObject *owner, IOTimerEventSource *) {
-        static_cast<NativeLegacyDisplay *>(owner)->pollProducer();
+    static void completionFired(OSObject *owner, IOInterruptEventSource *, int) {
+        static_cast<NativeLegacyDisplay *>(owner)->surfaceTick();
     }
 
-    void pollProducer() {
-        IOLockLock(producerLock);
-        const uint64_t generation = producerGeneration;
-        const bool pending = producerPending;
-        bool captured = producerCaptured;
-        uint32_t fence = producerFence;
-        IOLockUnlock(producerLock);
-        if (!pending) {
-            return;
-        }
+    static void vblankWake(void *context) {
+        static_cast<IOInterruptEventSource *>(context)->interruptOccurred(nullptr, nullptr, 0);
+    }
 
-        IOReturn result = kIOReturnSuccess;
-        if (!!native_adreno_capture_surface_producer != !!native_adreno_poll_surface_producer) {
-            result = kIOReturnUnsupported;
-        } else if (!captured) {
-            result = native_adreno_capture_surface_producer ?
-                native_adreno_capture_surface_producer(&fence) : kIOReturnSuccess;
-            captured = result == kIOReturnSuccess;
-        }
-        if (captured && result == kIOReturnSuccess && native_adreno_poll_surface_producer) {
-            result = native_adreno_poll_surface_producer(fence);
-        }
-
-        IOLockLock(producerLock);
-        const bool current = producerPending && generation == producerGeneration;
-        if (current) {
-            producerCaptured = captured;
-            producerFence = fence;
-            if (result != kIOReturnTimeout && result != kIOReturnNotReady) {
-                producerReadyTime = result == kIOReturnSuccess ? mach_continuous_time() : 0;
-                producerResult = result;
-                producerDone = true;
-                producerPending = false;
+    static void vblankFired(OSObject *owner, IOInterruptEventSource *, int) {
+        NativeLegacyDisplay *display = static_cast<NativeLegacyDisplay *>(owner);
+        NativeDpuVblankSample sample = {};
+        if (!display->displayStopping && native_dpu_vblank_take(&sample)) {
+            display->surfaceTick(&sample);
+            if (display->vsyncInterval && display->vsyncWanted()) {
+                native_legacy_vsync_notify(display, sample.absoluteTime,
+                    sample.continuousTime, display->vsyncInterval);
+                native_legacy_vsync_observed(1, display->vsyncHz);
             }
         }
-        IOLockUnlock(producerLock);
-
-        if (current && (result == kIOReturnTimeout || result == kIOReturnNotReady)) {
-            producerTimer->setTimeoutMS(1);
-        }
     }
 
-    bool waitSurfaceProducer(const OriginalLegacySwapRequest *request, uint32_t *fence) {
-        if (!producerLock || !producerTimer || displayStopping) {
+    static void producerReady(void *context, IOReturn result) {
+        NativeLegacyDisplay *display = static_cast<NativeLegacyDisplay *>(context);
+        IOInterruptEventSource *event = display->completionEvent;
+        event->retain();
+        IOLockLock(display->producerLock);
+        display->producerResult = result;
+        display->producerReadyTime = result == kIOReturnSuccess ? mach_continuous_time() : 0;
+        display->producerDone = true;
+        IOLockUnlock(display->producerLock);
+
+        event->interruptOccurred(nullptr, nullptr, 0);
+        event->release();
+    }
+
+    bool waitSurfaceProducer(const OriginalLegacySwapRequest *request,
+        IOMemoryDescriptor *memory, uint32_t *fence) {
+        if (!producerLock || !completionEvent || displayStopping) {
             return false;
         }
         if (producerRequest != request) {
@@ -971,32 +972,67 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
 
             IOLockLock(producerLock);
             producerWaitTime = mach_continuous_time();
+            clock_interval_to_deadline(5000, kMillisecondScale, &producerDeadline);
             producerFence = 0;
             producerResult = kIOReturnNotReady;
-            producerPending = true;
             IOLockUnlock(producerLock);
-            producerTimer->setTimeoutMS(1);
+
+            IOReturn result = kIOReturnSuccess;
+            const bool hasAcquire = !!native_adreno_surface_acquire_read;
+            if (hasAcquire != !!native_adreno_surface_read_status ||
+                hasAcquire != !!native_adreno_surface_release_read) {
+                result = kIOReturnUnsupported;
+            } else if (hasAcquire) {
+                result = native_adreno_surface_acquire_read(memory,
+                    &NativeLegacyDisplay::producerReady, this, &producerRead);
+            }
+            IOLockLock(producerLock);
+            if (!producerDone && result != kIOReturnNotReady) {
+                producerResult = result;
+                producerReadyTime = result == kIOReturnSuccess ? mach_continuous_time() : 0;
+                producerDone = true;
+            }
+            IOLockUnlock(producerLock);
+            if (result == kIOReturnNotReady) {
+                armSurfaceTimer(5000);
+            }
         }
 
         IOLockLock(producerLock);
+        if (!producerDone && mach_absolute_time() >= producerDeadline) {
+            producerResult = kIOReturnTimeout;
+            producerDone = true;
+        }
         const bool done = producerDone;
         const IOReturn result = producerResult;
-        *fence = producerFence;
         IOLockUnlock(producerLock);
         if (!done) {
-            armSurfaceTimer();
             return false;
         }
         if (result != kIOReturnSuccess) {
             if (result != surfaceProducerError) {
                 IOLog("T733 display: producer status=%x fence=%u request=%p\n",
-                    result, *fence, request);
+                    result, producerFence, request);
                 surfaceProducerError = result;
             }
-            armSurfaceTimer(10);
+            holdDpuRequest(request, DroppedCompletion, 0);
+            dpuResult = result;
+            clearProducerRequest();
+            completeDpuRequest();
             return false;
         }
 
+        if (producerRead) {
+            const IOReturn status = native_adreno_surface_read_status(producerRead, &producerFence);
+            if (status != kIOReturnSuccess) {
+                holdDpuRequest(request, DroppedCompletion, 0);
+                dpuResult = status;
+                clearProducerRequest();
+                completeDpuRequest();
+                return false;
+            }
+        }
+        *fence = producerFence;
         surfaceProducerError = kIOReturnSuccess;
         return true;
     }
@@ -1124,12 +1160,12 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         static_cast<NativeLegacyDisplay *>(owner)->surfaceTick();
     }
 
-    void surfaceTick() {
+    void surfaceTick(const NativeDpuVblankSample *sample = nullptr) {
         if (displayStopping || dpuBlocked) {
             return;
         }
         if (dpuCompletion != NoDpuCompletion) {
-            const IOReturn result = t733_dpu_surface_poll();
+            const IOReturn result = sample ? t733_dpu_surface_vblank(sample) : t733_dpu_surface_poll();
             if (result == kIOReturnNotReady) {
                 armSurfaceTimer();
                 return;
@@ -1170,24 +1206,32 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             return false;
         }
         producerLock = IOLockAlloc();
-        producerLoop = IOWorkLoop::workLoop();
         surfaceTimer = IOTimerEventSource::timerEventSource(this, &NativeLegacyDisplay::surfaceFired);
-        // Producer fence polling runs on producerLoop's thread. Default
-        // timer actions share XNU's serial kernel-high thread-call group with
-        // the display's frame and vsync timers.
-        producerTimer = IOTimerEventSource::timerEventSource(
-            kIOTimerEventSourceOptionsPriorityWorkLoop, this, &NativeLegacyDisplay::producerFired);
-        if (!producerLock || !producerLoop || !surfaceTimer || !producerTimer) {
+        completionEvent = IOInterruptEventSource::interruptEventSource(this,
+            &NativeLegacyDisplay::completionFired);
+        vblankEvent = IOInterruptEventSource::interruptEventSource(this,
+            &NativeLegacyDisplay::vblankFired);
+        if (!producerLock || !surfaceTimer || !completionEvent || !vblankEvent) {
             return false;
         }
         if (loop->addEventSource(surfaceTimer) != kIOReturnSuccess) {
             return false;
         }
         surfaceTimerAdded = true;
-        if (producerLoop->addEventSource(producerTimer) != kIOReturnSuccess) {
+        if (loop->addEventSource(completionEvent) != kIOReturnSuccess) {
             return false;
         }
-        producerTimerAdded = true;
+        completionEventAdded = true;
+        completionEvent->enable();
+        if (loop->addEventSource(vblankEvent) != kIOReturnSuccess) {
+            return false;
+        }
+        vblankEventAdded = true;
+        vblankEvent->enable();
+        const IOReturn irqResult = native_dpu_vblank_start(&NativeLegacyDisplay::vblankWake,
+            vblankEvent);
+        vblankInterrupt = irqResult == kIOReturnSuccess;
+        IOLog("T733 display: DPU vblank IRQ status=%x active=%u\n", irqResult, vblankInterrupt);
 
         displayStopping = false;
         frameInfoStopped = false;
@@ -1197,7 +1241,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void stopDpuSurface() {
         IOWorkLoop *loop = getWorkLoop();
         const bool alreadyGated = loop && loop->inGate();
-        if (!producerLock && !surfaceTimer && !producerTimer && !producerLoop) {
+        if (!producerLock && !surfaceTimer && !completionEvent && !vblankEvent) {
             return;
         }
 
@@ -1207,6 +1251,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             display->frameInfoStopped = true;
             display->discardFrameInfoReport();
             display->transferred = true;
+            if (display->vblankInterrupt) {
+                native_dpu_vblank_stop();
+                display->vblankInterrupt = false;
+            }
             if (display->surfaceTimer) {
                 display->surfaceTimer->disable();
                 display->surfaceTimer->cancelTimeout();
@@ -1216,31 +1264,26 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         };
         IOReturn result = loop ? loop->runAction(begin, this) : begin(this, nullptr, nullptr, nullptr, nullptr);
 
-        // Removal waits for the producer callback to leave its work loop. That
-        // callback never enters the display gate and holds no result lock here.
-        if (producerTimer) {
-            if (producerLoop && producerTimerAdded) {
-                producerLoop->runAction([](OSObject *owner, void *, void *, void *, void *) -> IOReturn {
-                    NativeLegacyDisplay *display = static_cast<NativeLegacyDisplay *>(owner);
-                    display->producerTimer->disable();
-                    display->producerTimer->cancelTimeout();
-                    return kIOReturnSuccess;
-                }, this);
-            } else {
-                producerTimer->disable();
-                producerTimer->cancelTimeout();
-            }
-            if (producerTimerAdded) {
-                producerLoop->removeEventSource(producerTimer);
-                producerTimerAdded = false;
-            }
+        if (completionEvent) {
+            completionEvent->disable();
+        }
+        if (vblankEvent) {
+            vblankEvent->disable();
+        }
+        if (vblankEventAdded && loop) {
+            loop->removeEventSource(vblankEvent);
+            vblankEventAdded = false;
+        }
+        if (completionEventAdded && loop) {
+            loop->removeEventSource(completionEvent);
+            completionEventAdded = false;
         }
         if (surfaceTimerAdded && loop) {
             loop->removeEventSource(surfaceTimer);
             surfaceTimerAdded = false;
         }
-        OSSafeReleaseNULL(producerTimer);
-        OSSafeReleaseNULL(producerLoop);
+        OSSafeReleaseNULL(completionEvent);
+        OSSafeReleaseNULL(vblankEvent);
         OSSafeReleaseNULL(surfaceTimer);
 
         auto poll = [](OSObject *, void *, void *, void *, void *) -> IOReturn {
@@ -1282,8 +1325,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
 
         holdDpuRequest(request, SurfaceCompletion, stride * height);
         IOReturn result = t733_dpu_surface_begin(surface, memory, stride, width, height,
-            layerZeroFence(request));
+            layerZeroFence(request), producerRead);
         if (result == kIOReturnSuccess) {
+            producerRead = nullptr;
             transferLayerZeroFence(request);
             if (native_adreno_surface_profile_capture) {
                 const uint64_t compositionStartUs =
@@ -1349,12 +1393,19 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     void startVsync() {
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
         if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
+        nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
+        vsyncHz=hz;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        if (vblankInterrupt) {
+            native_legacy_vsync_observed(4, hz);
+            return;
+        }
+#endif
         IOWorkLoop *loop=getWorkLoop();
         if(!loop)return;
         IOTimerEventSource *timer=IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::vsyncFired);
         if(!timer)return;
         if(loop->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
-        nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
         vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);
         // A client may already have registered: arm under the gate, like the registration does.
         loop->runAction([](OSObject *owner,void *,void *,void *,void *)->IOReturn {
@@ -1652,7 +1703,7 @@ public:
             return;
         }
         uint32_t producerFence = 0;
-        if (!waitSurfaceProducer(request, &producerFence)) {
+        if (!waitSurfaceProducer(request, memory, &producerFence)) {
             return;
         }
 #endif

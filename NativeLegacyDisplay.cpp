@@ -13,6 +13,8 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOUserClient.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/IONotifier.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -20,6 +22,7 @@
 #include <mach/message.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSDictionary.h>
@@ -555,6 +558,34 @@ static bool nativeLegacyCopyPairs(volatile void *destination, uint64_t destinati
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+    IONotifier *shutdownNotifier = nullptr;
+
+    static IOReturn shutdownNotification(void *target, void *, UInt32 message,
+        IOService *, void *, vm_size_t) {
+        if (message != kIOMessageSystemPagingOff) {
+            return kIOReturnSuccess;
+        }
+
+        auto display = static_cast<NativeLegacyDisplay *>(target);
+        // PagingOff precedes vnode destruction. The display gate stops new
+        // presents before the firmware flip retires the final surface read.
+        display->stopFrameInfo();
+        display->stopVsync();
+        display->stopDpuSurface();
+        display->clearSourceMappings();
+        IOLog("T733 display shutdown: paging_off=1 presents_stopped=%u scanout_retained=%u\n",
+            unsigned(display->displayStopping), unsigned(display->dpuBlocked));
+        return kIOReturnSuccess;
+    }
+
+    void removeShutdownNotifier() {
+        if (shutdownNotifier) {
+            shutdownNotifier->remove();
+            shutdownNotifier = nullptr;
+        }
+    }
+#endif
 
     static constexpr uint32_t FrameInfoPresentationMask = 1U;
     static constexpr uint32_t FrameInfoRequestedMask = 2U;
@@ -1445,6 +1476,9 @@ public:
         if(loop)loop->runAction(action,this,&args);else finishGpuSwap(status);
     }
     void free() override {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        removeShutdownNotifier();
+#endif
         stopFrameInfo();
         stopVsync();
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
@@ -1467,6 +1501,9 @@ public:
         IOMobileFramebufferLegacy::free();
     }
     void stop(IOService *provider) override {
+#if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
+        removeShutdownNotifier();
+#endif
         stopFrameInfo();
         stopVsync();
 #if defined(NATIVE_T733_FIRMWARE_DISPLAY) && NATIVE_T733_FIRMWARE_DISPLAY
@@ -1504,6 +1541,14 @@ public:
         if (primary && bootMapping && !startSurfaceEvents()) {
             stop(provider);
             return false;
+        }
+        if (primary && bootMapping) {
+            shutdownNotifier = registerPrioritySleepWakeInterest(
+                shutdownNotification, this, nullptr);
+            if (!shutdownNotifier) {
+                stop(provider);
+                return false;
+            }
         }
 #endif
         startVsync();return true;
